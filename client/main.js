@@ -614,53 +614,62 @@ async function batchFetchVisibleOnce() {
     dlog('Batch restore unavailable; falling back to per-tile', e?.message || e);
   }
 }
+// Fetch a batch of tiles (via worker if available, otherwise HTTP)
+async function fetchTilesBatch(tilesList, z = 0) {
+  if (!Array.isArray(tilesList) || tilesList.length === 0) return [];
+  const worker = ensureWorker();
+  if (worker) {
+    const reqId = cryptoId();
+    return await new Promise((resolve) => {
+      _workerPending.set(reqId, { resolve, reject: () => {}, type: 'batch' });
+      try { worker.postMessage({ type: 'batchFetch', id: reqId, z, tiles: tilesList }); } catch (e) { _workerPending.delete(reqId); resolve([]); }
+    });
+  }
+  try {
+    const res = await fetch('/api/tile-strokes-batch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ z, tiles: tilesList })
+    });
+    if (!res.ok) return [];
+    const json = await res.json().catch(() => ({}));
+    return Array.isArray(json?.tiles) ? json.tiles : [];
+  } catch (e) { return []; }
+}
 
-// Populate/validate localStorage for all visible tiles using per-tile GETs
+// Populate/validate localStorage for all visible tiles using chunked batch requests
 async function populateVisibleFromServer() {
   const { tx0, ty0, tx1, ty1 } = visibleTileBounds();
   const z = 0;
-  // Limit concurrent network activity to avoid blocking rendering
-  const CONCURRENCY = 6;
-  const queue = [];
-  for (let ty = ty0; ty <= ty1; ty++) {
-    for (let tx = tx0; tx <= tx1; tx++) {
-      const k = tileKey(tx, ty, z);
-      dlog('Populate LS: schedule', { tile: k });
-      queue.push({ tx, ty, k });
-    }
-  }
-  const worker = async (item) => {
-    try {
-      const strokes = await loadTileStrokes(item.tx, item.ty, z);
-      const arr = Array.isArray(strokes) ? strokes : [];
-      // Always write authoritative list to LS (deferred inside lsSave)
-      lsSaveTileStrokes(z, item.tx, item.ty, arr);
-      // If tile object exists, reset and rehydrate strictly from LS
-      const t = tiles.get(item.k);
-      if (t) {
-        resetTile(t);
-        const cached = lsLoadTileStrokes(z, item.tx, item.ty) || [];
-        for (const s of cached) { if (s && s.id) { drawStrokeOnTile(t, s); t.seen.add(s.id); t.cached.push(s); } }
-        t.dirty = true;
-      }
-      dlog('Populate LS: applied', { tile: item.k, strokes: arr.length });
-    } catch (err) { dlog('Populate LS: fetch error', { tile: item.k, err: String(err) }); }
-  };
+  const tilesList = [];
+  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) tilesList.push({ tx, ty });
+  if (tilesList.length === 0) return;
+  dlog('Populate LS: batches', { count: tilesList.length });
 
-  const runners = [];
-  while (queue.length) {
-    while (runners.length < CONCURRENCY && queue.length) {
-      const item = queue.shift();
-      const p = worker(item).finally(() => {
-        const idx = runners.indexOf(p);
-        if (idx >= 0) runners.splice(idx, 1);
-      });
-      runners.push(p);
+  // Chunk size tuned to balance payload size and server load
+  const CHUNK = 64;
+  for (let i = 0; i < tilesList.length; i += CHUNK) {
+    const chunk = tilesList.slice(i, i + CHUNK);
+    try {
+      const resp = await fetchTilesBatch(chunk, z);
+      for (const t of resp || []) {
+        const arr = Array.isArray(t.strokes) ? t.strokes : [];
+        lsSaveTileStrokes(z, t.tx, t.ty, arr);
+        const key = tileKey(t.tx, t.ty, z);
+        const tile = tiles.get(key);
+        if (tile) {
+          resetTile(tile);
+          const cached = lsLoadTileStrokes(z, t.tx, t.ty) || [];
+          for (const s of cached) { if (s && s.id) { drawStrokeOnTile(tile, s); tile.seen.add(s.id); tile.cached.push(s); } }
+          tile.dirty = true;
+        }
+        dlog('Populate LS: applied batch tile', { tile: key, strokes: arr.length });
+      }
+      // Yield to rendering between chunks
+      await new Promise(r => setTimeout(r, 0));
+    } catch (err) {
+      dlog('Populate LS: batch fetch error', String(err));
     }
-    // Wait until any runner completes to schedule more
-    if (runners.length) await Promise.race(runners.map(p => p.then(() => {}, () => {})));
   }
-  await Promise.all(runners);
   dlog('Populate LS: done');
 }
 
