@@ -480,143 +480,34 @@ function tilesForStroke(stroke) {
   return list;
 }
 
-// Service Worker Communication
-let serviceWorker = null;
-let swReady = false;
-const swMessageId = { current: 0 };
-const swPendingRequests = new Map();
-
-// Initialize service worker
-async function initServiceWorker() {
-  if ('serviceWorker' in navigator) {
-    try {
-      // Unregister any previous registrations for tile-worker.js so we don't
-      // continue running an old cached worker that may reference removed globals.
-      try {
-        const regs = await navigator.serviceWorker.getRegistrations();
-        for (const r of regs) {
-          try {
-            if (r.active && r.active.scriptURL && r.active.scriptURL.includes('tile-worker.js')) {
-              await r.unregister();
-            }
-          } catch (e) { /* ignore individual unregister errors */ }
-        }
-      } catch (e) { /* ignore getRegistrations errors */ }
-
-      // Register the (fresh) worker script.
-      const registration = await navigator.serviceWorker.register('/tile-worker.js');
-      dlog('Service worker registered:', registration);
-      
-      serviceWorker = registration.active || registration.waiting || registration.installing;
-      
-      if (serviceWorker) {
-        if (serviceWorker.state === 'activated') {
-          swReady = true;
-          dlog('Service worker ready');
-        } else {
-          serviceWorker.addEventListener('statechange', () => {
-            if (serviceWorker.state === 'activated') {
-              swReady = true;
-              dlog('Service worker activated');
-            }
-          });
-        }
-      }
-      
-      // Listen for messages from service worker
-      navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
-      
-    } catch (error) {
-      console.error('Service worker registration failed:', error);
-    }
-  }
-}
-
-function handleServiceWorkerMessage(event) {
-  const { type, id, payload, error } = event.data;
-  
-  switch (type) {
-    case 'TILE_STROKES_RESULT':
-      handleTileStrokesResult(id, payload);
-      break;
-    case 'TILE_STROKES_BATCH_RESULT':
-      handleTileStrokesBatchResult(id, payload);
-      break;
-    case 'ERROR':
-      handleServiceWorkerError(id, error);
-      break;
-    default:
-      dlog('Unknown service worker message:', type);
-  }
-}
-
-function handleTileStrokesResult(requestId, { tx, ty, z, strokes, fromCache, error }) {
-  const request = swPendingRequests.get(requestId);
-  if (!request) return;
-  
-  swPendingRequests.delete(requestId);
-  
-  if (error) {
-    dlog('Tile fetch error from worker:', { tile: `${z}:${tx}:${ty}`, error });
-    request.resolve([]);
-  } else {
-    dlog('Tile fetch result from worker:', { tile: `${z}:${tx}:${ty}`, strokes: strokes.length, fromCache });
-    request.resolve(strokes);
-  }
-}
-
-function handleTileStrokesBatchResult(requestId, { z, tiles }) {
-  const request = swPendingRequests.get(requestId);
-  if (!request) return;
-  
-  swPendingRequests.delete(requestId);
-  request.resolve({ tiles });
-}
-
-function handleServiceWorkerError(requestId, error) {
-  const request = swPendingRequests.get(requestId);
-  if (!request) return;
-  
-  swPendingRequests.delete(requestId);
-  request.reject(new Error(error));
-}
-
-function sendToServiceWorker(type, payload) {
-  if (!swReady || !serviceWorker) {
-    throw new Error('Service worker not ready');
-  }
-  
-  const id = ++swMessageId.current;
-  
-  return new Promise((resolve, reject) => {
-    swPendingRequests.set(id, { resolve, reject });
-    
-    // Timeout after 10 seconds
-    setTimeout(() => {
-      if (swPendingRequests.has(id)) {
-        swPendingRequests.delete(id);
-        reject(new Error('Service worker request timeout'));
-      }
-    }, 10000);
-    
-    serviceWorker.postMessage({
-      type,
-      id,
-      payload
-    });
-  });
-}
-
 // Networking
 async function loadTileStrokes(tx, ty, z = 0) {
-  // Service-worker only: send request to service worker and return its result.
-  if (!swReady || !serviceWorker) {
-    throw new Error('Service worker not ready');
-  }
-
-  // Forward to service worker and return strokes array (worker handles debouncing)
-  const strokes = await sendToServiceWorker('FETCH_TILE_STROKES', { tx, ty, z });
-  return strokes;
+  // Debounce tile fetches to avoid spamming the network
+  if (!loadTileStrokes._q) loadTileStrokes._q = new Map();
+  const k = `${z}:${tx}:${ty}`;
+  const q = loadTileStrokes._q;
+  const existing = q.get(k);
+  if (existing && existing.pending) return existing.pending;
+  dlog('Schedule tile fetch', k);
+  let timer = null;
+  const pending = new Promise((resolve, reject) => {
+    timer = setTimeout(async () => {
+      try {
+        const url = `/api/tile-strokes?z=${z}&tx=${tx}&ty=${ty}`;
+        const res = await fetch(url);
+        if (!res.ok) {
+          dlog('Tile fetch failed', { tile: k, status: res.status, statusText: res.statusText });
+          resolve([]);
+          return;
+        }
+        const json = await res.json().catch(() => ({}));
+        resolve(json?.strokes || []);
+      } catch (e) { reject(e); }
+      finally { q.delete(k); }
+    }, 200);
+  });
+  q.set(k, { timer, pending });
+  return pending;
 }
 
 // Initial one-shot batch fetch for all visible tiles to quickly restore from server
@@ -638,41 +529,41 @@ async function batchFetchVisibleOnce() {
   const tilesList = [];
   for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) tilesList.push({ tx, ty });
   if (tilesList.length === 0) return;
-  
-  // Try service worker first
-  if (swReady && serviceWorker) {
-    try {
-      const z = 0;
-      dlog('Batch restore via service worker', { count: tilesList.length, bounds: { tx0, ty0, tx1, ty1 } });
-      const result = await sendToServiceWorker('FETCH_TILE_STROKES_BATCH', { z, tiles: tilesList });
-      
-      for (const t of result.tiles || []) {
-        const arr = Array.isArray(t.strokes) ? t.strokes : [];
-        // Persist authoritative list in LS for this tile
-        lsSaveTileStrokes(z, t.tx, t.ty, arr);
-        // If we already have the tile object, reset and draw strictly from LS
-        const key = tileKey(t.tx, t.ty, z);
-        const tile = tiles.get(key);
-        if (tile) {
-          resetTile(tile);
-          const cached = lsLoadTileStrokes(z, t.tx, t.ty) || [];
-          for (const s of cached) { if (s && s.id) { drawStrokeOnTile(tile, s); tile.seen.add(s.id); tile.cached.push(s); } }
-          tile.dirty = true;
-        }
-        dlog('Batch tile applied via service worker', { tile: key, strokes: arr.length });
-      }
-      dlog('Batch restore done via service worker');
-      requestFrame();
-      return;
-    } catch (error) {
-      dlog('Service worker batch fetch failed, falling back to direct fetch:', error);
+  try {
+    const z = 0;
+    // Single batch request
+    dlog('Batch restore start', { count: tilesList.length, bounds: { tx0, ty0, tx1, ty1 } });
+    const res = await fetch('/api/tile-strokes-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ z, tiles: tilesList })
+    });
+    if (!res.ok) {
+      dlog('Batch restore HTTP error', { status: res.status, statusText: res.statusText });
+      throw new Error('batch failed');
     }
+    const json = await res.json();
+    for (const t of json.tiles || []) {
+      const arr = Array.isArray(t.strokes) ? t.strokes : [];
+      // Persist authoritative list in LS for this tile
+      lsSaveTileStrokes(z, t.tx, t.ty, arr);
+      // If we already have the tile object, reset and draw strictly from LS
+      const key = tileKey(t.tx, t.ty, z);
+      const tile = tiles.get(key);
+      if (tile) {
+        resetTile(tile);
+        const cached = lsLoadTileStrokes(z, t.tx, t.ty) || [];
+        for (const s of cached) { if (s && s.id) { drawStrokeOnTile(tile, s); tile.seen.add(s.id); tile.cached.push(s); } }
+        tile.dirty = true;
+      }
+      dlog('Batch tile applied', { tile: key, strokes: arr.length });
+    }
+    dlog('Batch restore done');
+    requestFrame();
+  } catch (e) {
+    // Fall back: per-tile lazy fetch will still occur
+    dlog('Batch restore unavailable; falling back to per-tile', e?.message || e);
   }
-  
-  // If service worker batch fetch fails above, we intentionally do NOT
-  // fallback to direct network requests from the main thread. The worker
-  // is responsible for fetching and processing tiles exclusively.
-  dlog('Batch restore: service worker unavailable or failed; no direct fallback allowed');
 }
 
 // Populate/validate localStorage for all visible tiles using per-tile GETs
@@ -954,12 +845,6 @@ function updateUrlFromView() {
 resize();
 setTool(initialTool);
 loadViewFromUrl();
-initServiceWorker().then(() => {
-  connectWS();
-  // Populate LS for visible tiles at startup (works even if batch API is unavailable)
-  populateVisibleFromServer().finally(() => { requestFrame(); });
-}).catch(() => {
-  // Service worker failed, continue without it
-  connectWS();
-  populateVisibleFromServer().finally(() => { requestFrame(); });
-});
+connectWS();
+// Populate LS for visible tiles at startup (works even if batch API is unavailable)
+populateVisibleFromServer().finally(() => { requestFrame(); });

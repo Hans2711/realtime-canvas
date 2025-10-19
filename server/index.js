@@ -231,29 +231,6 @@ export function startServer(options = {}) {
       return jsonResponse({ z, tx, ty, strokes });
     }
 
-    // API: batch fetch strokes for multiple tiles
-    if (pathname === '/api/tile-strokes-batch' && req.method === 'POST') {
-      try {
-        const json = await req.json();
-        const z = Number(json.z ?? Z);
-        const requestedTiles = Array.isArray(json.tiles) ? json.tiles : [];
-        
-        const results = [];
-        for (const tile of requestedTiles) {
-          const tx = Number(tile.tx);
-          const ty = Number(tile.ty);
-          if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
-          
-          const strokes = await readTileStrokes(z, tx, ty);
-          results.push({ tx, ty, strokes });
-        }
-        
-        return jsonResponse({ z, tiles: results });
-      } catch {
-        return jsonResponse({ error: 'invalid json' }, 400);
-      }
-    }
-
     // API: persist stroke (JSON)
     if (pathname === '/api/stroke' && req.method === 'POST') {
       try {
