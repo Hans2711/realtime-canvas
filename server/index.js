@@ -318,7 +318,7 @@ export function startServer(options = {}) {
       }
       ws.send(JSON.stringify({ type: 'welcome', payload: { id, color, name, others: snapshot } }));
     },
-    message(ws, message) {
+  async message(ws, message) {
       let msg;
       try {
         const raw = typeof message === 'string' ? message : (message instanceof Uint8Array ? new TextDecoder('utf-8').decode(message) : String(message));
@@ -349,6 +349,42 @@ export function startServer(options = {}) {
         };
         try { appendStrokeToTiles(stroke); } catch (_) {}
         broadcast('stroke', stroke, id);
+      } else if (type === 'tilesRequest') {
+        // Stream tile data back to the requesting socket, one message per tile.
+        // payload: { reqId, z, tiles: [{tx,ty}, ...] }
+        try {
+          const reqId = payload?.reqId || null;
+          const zVal = Number(payload?.z ?? Z);
+          const tilesArr = Array.isArray(payload?.tiles) ? payload.tiles : [];
+          // limit tiles per request to avoid abuse
+          const MAX_BATCH = 1000;
+          if (tilesArr.length === 0) {
+            ws.send(JSON.stringify({ type: 'tileBatchDone', payload: { reqId } }));
+            return;
+          }
+          if (tilesArr.length > MAX_BATCH) {
+            // send done immediately
+            ws.send(JSON.stringify({ type: 'tileBatchDone', payload: { reqId } }));
+            return;
+          }
+          for (const t of tilesArr) {
+            const tx = Number(t?.tx);
+            const ty = Number(t?.ty);
+            if (!Number.isFinite(tx) || !Number.isFinite(ty)) continue;
+            try {
+              const strokes = await readTileStrokes(zVal, tx, ty);
+              // send each tile as its own message so client can stream-parse them
+              ws.send(JSON.stringify({ type: 'tileData', payload: { reqId, z: zVal, tx, ty, strokes } }));
+            } catch (e) {
+              // continue on error per-tile
+              try { ws.send(JSON.stringify({ type: 'tileData', payload: { reqId, z: zVal, tx, ty, strokes: [] } })); } catch {}
+            }
+          }
+          // Indicate completion
+          try { ws.send(JSON.stringify({ type: 'tileBatchDone', payload: { reqId } })); } catch {}
+        } catch (e) {
+          // ignore
+        }
       }
     },
     close(ws) {
