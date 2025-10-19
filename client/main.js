@@ -1,8 +1,11 @@
 const TILE_SIZE = window.__CONFIG__?.TILE_SIZE || 1024;
+// Debug: enable with ?debug=1 or localStorage.setItem('debug','1')
+const DEBUG = /(?:[?&])debug=1(?:&|$)/.test(location.search) || localStorage.getItem('debug') === '1';
+function dlog(...args) { if (DEBUG) console.log('[IC]', ...args); }
 // Extra offscreen pixels around each tile to avoid seam clipping
 const TILE_PAD = 128; // should be >= max brush size
 // Limit maximum zoom-out to reduce tile load
-const MIN_SCALE = 0.03;
+const MIN_SCALE = 0.14;
 const MAX_SCALE = 4;
 const STATE = { dpr: window.devicePixelRatio || 1, showGrid: true };
 const TILE_CACHE_MAX = 256; // allow more tiles in memory while bounded
@@ -136,25 +139,49 @@ function tryGetTile(tx, ty, z = 0) {
     // Restore from localStorage first
     const cached = lsLoadTileStrokes(z, tx, ty);
     if (cached && cached.length) {
+      dlog('LS restore', { tile: key, strokes: cached.length });
       for (const s of cached) { if (s && s.id && !t.seen.has(s.id)) { drawStrokeOnTile(t, s); t.seen.add(s.id); t.cached.push(s); } }
       t.loaded = true;
     }
     // Then lazy load strokes from server and merge only new ones
     loadTileStrokes(tx, ty, z).then(strokes => {
+      dlog('HTTP restore result', { tile: key, strokes: (strokes||[]).length });
       let added = 0;
       for (const s of strokes) {
         if (!s || !s.id || t.seen.has(s.id)) continue;
-        drawStrokeOnTile(t, s);
         t.seen.add(s.id);
         t.cached.push(s);
         added++;
       }
-      if (added > 0) lsSaveTileStrokes(z, tx, ty, t.cached);
+      if (added > 0) {
+        // Persist authoritative list first
+        lsSaveTileStrokes(z, tx, ty, t.cached);
+        // Rehydrate strictly from LS, then render from LS
+        const fresh = lsLoadTileStrokes(z, tx, ty) || [];
+        resetTile(t);
+        for (const s of fresh) { if (s && s.id) { drawStrokeOnTile(t, s); t.seen.add(s.id); } }
+        t.cached = fresh;
+        t.dirty = true;
+      }
       t.loaded = true; requestFrame();
     }).catch(() => {});
   }
   t.lastUsed = frameCounter;
   return t;
+}
+
+// Reset a tile's composited content and per-user layers
+function resetTile(tile) {
+  try { tile.layers = new Map(); } catch {}
+  try { tile.seen = new Set(); } catch {}
+  try {
+    const tctx = tile.ctx;
+    tctx.setTransform(1, 0, 0, 1, 0, 0);
+    tctx.clearRect(0, 0, tile.canvas.width, tile.canvas.height);
+  } catch {}
+  tile.cached = [];
+  tile.dirty = true;
+  dlog('Tile reset', tile.key);
 }
 
 function destroyTile(t) {
@@ -455,10 +482,118 @@ function tilesForStroke(stroke) {
 
 // Networking
 async function loadTileStrokes(tx, ty, z = 0) {
-  const res = await fetch(`/api/tile-strokes?z=${z}&tx=${tx}&ty=${ty}`);
-  if (!res.ok) throw new Error('tile load failed');
-  const json = await res.json();
-  return json.strokes || [];
+  // Debounce tile fetches to avoid spamming the network
+  if (!loadTileStrokes._q) loadTileStrokes._q = new Map();
+  const k = `${z}:${tx}:${ty}`;
+  const q = loadTileStrokes._q;
+  const existing = q.get(k);
+  if (existing && existing.pending) return existing.pending;
+  dlog('Schedule tile fetch', k);
+  let timer = null;
+  const pending = new Promise((resolve, reject) => {
+    timer = setTimeout(async () => {
+      try {
+        const url = `/api/tile-strokes?z=${z}&tx=${tx}&ty=${ty}`;
+        const res = await fetch(url);
+        if (!res.ok) {
+          dlog('Tile fetch failed', { tile: k, status: res.status, statusText: res.statusText });
+          resolve([]);
+          return;
+        }
+        const json = await res.json().catch(() => ({}));
+        resolve(json?.strokes || []);
+      } catch (e) { reject(e); }
+      finally { q.delete(k); }
+    }, 200);
+  });
+  q.set(k, { timer, pending });
+  return pending;
+}
+
+// Initial one-shot batch fetch for all visible tiles to quickly restore from server
+function visibleTileBounds() {
+  const dpr = STATE.dpr;
+  const cssW = canvas.width / dpr;
+  const cssH = canvas.height / dpr;
+  const tl = screenToWorld(0, 0);
+  const br = screenToWorld(cssW, cssH);
+  const tx0 = Math.floor(tl.x / TILE_SIZE);
+  const ty0 = Math.floor(tl.y / TILE_SIZE);
+  const tx1 = Math.floor(br.x / TILE_SIZE);
+  const ty1 = Math.floor(br.y / TILE_SIZE);
+  return { tx0, ty0, tx1, ty1 };
+}
+
+async function batchFetchVisibleOnce() {
+  const { tx0, ty0, tx1, ty1 } = visibleTileBounds();
+  const tilesList = [];
+  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) tilesList.push({ tx, ty });
+  if (tilesList.length === 0) return;
+  try {
+    const z = 0;
+    // Single batch request
+    dlog('Batch restore start', { count: tilesList.length, bounds: { tx0, ty0, tx1, ty1 } });
+    const res = await fetch('/api/tile-strokes-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ z, tiles: tilesList })
+    });
+    if (!res.ok) {
+      dlog('Batch restore HTTP error', { status: res.status, statusText: res.statusText });
+      throw new Error('batch failed');
+    }
+    const json = await res.json();
+    for (const t of json.tiles || []) {
+      const arr = Array.isArray(t.strokes) ? t.strokes : [];
+      // Persist authoritative list in LS for this tile
+      lsSaveTileStrokes(z, t.tx, t.ty, arr);
+      // If we already have the tile object, reset and draw strictly from LS
+      const key = tileKey(t.tx, t.ty, z);
+      const tile = tiles.get(key);
+      if (tile) {
+        resetTile(tile);
+        const cached = lsLoadTileStrokes(z, t.tx, t.ty) || [];
+        for (const s of cached) { if (s && s.id) { drawStrokeOnTile(tile, s); tile.seen.add(s.id); tile.cached.push(s); } }
+        tile.dirty = true;
+      }
+      dlog('Batch tile applied', { tile: key, strokes: arr.length });
+    }
+    dlog('Batch restore done');
+    requestFrame();
+  } catch (e) {
+    // Fall back: per-tile lazy fetch will still occur
+    dlog('Batch restore unavailable; falling back to per-tile', e?.message || e);
+  }
+}
+
+// Populate/validate localStorage for all visible tiles using per-tile GETs
+async function populateVisibleFromServer() {
+  const { tx0, ty0, tx1, ty1 } = visibleTileBounds();
+  const z = 0;
+  const tasks = [];
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      const k = tileKey(tx, ty, z);
+      dlog('Populate LS: schedule', { tile: k });
+      const p = loadTileStrokes(tx, ty, z).then(strokes => {
+        const arr = Array.isArray(strokes) ? strokes : [];
+        // Always write authoritative list to LS
+        lsSaveTileStrokes(z, tx, ty, arr);
+        // If tile object exists, reset and rehydrate strictly from LS
+        const t = tiles.get(k);
+        if (t) {
+          resetTile(t);
+          const cached = lsLoadTileStrokes(z, tx, ty) || [];
+          for (const s of cached) { if (s && s.id) { drawStrokeOnTile(t, s); t.seen.add(s.id); t.cached.push(s); } }
+          t.dirty = true;
+        }
+        dlog('Populate LS: applied', { tile: k, strokes: arr.length });
+      }).catch(err => { dlog('Populate LS: fetch error', { tile: k, err: String(err) }); });
+      tasks.push(p);
+    }
+  }
+  await Promise.all(tasks);
+  dlog('Populate LS: done');
 }
 
 function sendStroke(stroke) {
@@ -467,14 +602,24 @@ function sendStroke(stroke) {
     try { ws.send(JSON.stringify(msg)); return; } catch {}
   }
   // fallback to HTTP
-  fetch('/api/stroke', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(stroke) }).catch(() => {});
+  // Debounce persist calls slightly so quick successive finalize events don't spam
+  if (!sendStroke._timer) sendStroke._timer = null;
+  if (!sendStroke._queue) sendStroke._queue = [];
+  sendStroke._queue.push(stroke);
+  clearTimeout(sendStroke._timer);
+  sendStroke._timer = setTimeout(() => {
+    const last = sendStroke._queue[sendStroke._queue.length - 1];
+    sendStroke._queue.length = 0;
+    dlog('HTTP persist stroke', { id: last?.id, points: last?.points?.length || 0 });
+    fetch('/api/stroke', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(last) }).catch(() => {});
+  }, 200);
 }
 
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.addEventListener('open', () => { wsReady = true; });
-  ws.addEventListener('close', () => { wsReady = false; setTimeout(connectWS, 1000); });
+  ws.addEventListener('open', () => { wsReady = true; dlog('WS open'); });
+  ws.addEventListener('close', () => { wsReady = false; dlog('WS close'); setTimeout(connectWS, 1000); });
   ws.addEventListener('message', (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     const { type, payload } = msg || {};
@@ -484,6 +629,7 @@ function connectWS() {
       // Sync our current picker color to presence immediately
       const center = screenToWorld((canvas.width / STATE.dpr) / 2, (canvas.height / STATE.dpr) / 2);
       sendPresence(center);
+      dlog('WS welcome', { peers: (payload.others||[]).length, id: myId });
       requestFrame();
     } else if (type === 'presence') {
       const { id, x, y, color, name } = payload;
@@ -494,6 +640,7 @@ function connectWS() {
       requestFrame();
     } else if (type === 'stroke') {
       // Draw onto tiles
+      dlog('WS stroke', { id: payload?.id, points: payload?.points?.length || 0 });
       const tilesTouched = tilesForStroke(payload);
       for (const { tx, ty } of tilesTouched) {
         const t = tryGetTile(tx, ty);
@@ -695,4 +842,5 @@ resize();
 setTool(initialTool);
 loadViewFromUrl();
 connectWS();
-requestFrame();
+// Populate LS for visible tiles at startup (works even if batch API is unavailable)
+populateVisibleFromServer().finally(() => { requestFrame(); });
