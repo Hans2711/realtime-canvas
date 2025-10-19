@@ -1,0 +1,16 @@
+{
+  "name": "infinite-canvas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A shared, boundless drawing universe (MVP)",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "bun server/index.js",
+    "dev": "bun --watch server/index.js",
+    "test": "bun test"
+  },
+  "dependencies": {},
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}

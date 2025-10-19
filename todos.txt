@@ -1,0 +1,2 @@
+compression
+color picker consistency

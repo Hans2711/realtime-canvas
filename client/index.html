@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Infinite Canvas</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#111" />
+  <style>
+    /* Fallback in case CSS fails */
+    html, body { margin: 0; height: 100%; background: #0f1115; color: #eaeef6; }
+  </style>
+  <script>
+    window.__CONFIG__ = { TILE_SIZE: 1024 };
+  </script>
+</head>
+<body>
+  <div id="ui">
+    <div class="toolbar">
+      <button id="tool-pen" class="tool active" title="Pen (B)">✒️ Pen</button>
+      <button id="tool-eraser" class="tool" title="Eraser (E)">🩹 Eraser</button>
+      <label class="sep">
+        <input id="color" type="color" value="#ff4d4f" />
+      </label>
+      <label>
+        Size <input id="size" type="range" min="2" max="128" value="12" />
+      </label>
+      <label>
+        Opacity <input id="opacity" type="range" min="0.1" max="1" value="1" step="0.05" />
+      </label>
+      <label title="Show/Hide grid lines">
+        <input id="toggle-grid" type="checkbox" checked /> Grid
+      </label>
+      <span class="hint">Hold Space to pan • Scroll to zoom</span>
+    </div>
+  </div>
+
+  <div id="stage">
+    <canvas id="canvas" width="800" height="600"></canvas>
+    <canvas id="overlay" width="800" height="600"></canvas>
+  </div>
+
+  <script src="/main.js" type="module"></script>
+</body>
+</html>

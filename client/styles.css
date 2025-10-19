@@ -1,0 +1,70 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a22;
+  --text: #eaeef6;
+  --muted: #9aa4b2;
+  --accent: #6aa5ff;
+  --border: #2a2f3a;
+}
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+#ui {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 10;
+}
+
+.toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+  background: linear-gradient(180deg, rgba(23,26,34,0.9), rgba(23,26,34,0.6));
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+}
+
+.toolbar .tool {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.toolbar .tool.active {
+  outline: 2px solid var(--accent);
+}
+
+.toolbar input[type="color"] {
+  width: 32px; height: 32px;
+  border: none; background: transparent; padding: 0; cursor: pointer;
+}
+
+.toolbar input[type="range"] {
+  vertical-align: middle;
+}
+
+.toolbar .hint {
+  color: var(--muted);
+  margin-left: auto;
+}
+
+#stage {
+  position: absolute; inset: 0;
+}
+
+#canvas, #overlay {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+  display: block;
+}
+
+#overlay { pointer-events: none; }
+
