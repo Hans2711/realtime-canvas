@@ -5,17 +5,44 @@
 
 import path from 'path';
 import fs from 'fs';
+import { Database } from 'bun:sqlite';
 
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = path.resolve(import.meta.dir, '..');
 const CLIENT_DIR = path.join(ROOT, 'client');
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
-const LOG_DIR = path.join(DATA_DIR, 'tiles');
-const GZIP_LEVEL = Number(process.env.GZIP_LEVEL || 9);
 const TILE_SIZE = 1024; // px
 const Z = 0; // single resolution for MVP
 
-fs.mkdirSync(LOG_DIR, { recursive: true });
+// Initialize SQLite store (Bun native)
+const DB_PATH = path.join(DATA_DIR, 'tiles.sqlite3');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const db = new Database(DB_PATH);
+db.exec(`
+  -- Use in-memory journaling to avoid filesystem restrictions (no -wal/-shm files)
+  PRAGMA journal_mode = MEMORY;
+  PRAGMA synchronous = OFF;
+  PRAGMA temp_store = memory;
+  CREATE TABLE IF NOT EXISTS tile_strokes (
+    z   INTEGER NOT NULL,
+    tx  INTEGER NOT NULL,
+    ty  INTEGER NOT NULL,
+    t   INTEGER NOT NULL,
+    id  TEXT    NOT NULL,
+    json BLOB   NOT NULL -- gzip-compressed JSON
+  );
+  CREATE INDEX IF NOT EXISTS idx_tile ON tile_strokes (z, tx, ty, t);
+`);
+
+const insertStrokeStmt = db.prepare('INSERT INTO tile_strokes (z, tx, ty, t, id, json) VALUES (?, ?, ?, ?, ?, ?)');
+const selectTileAllStmt = db.prepare('SELECT json FROM tile_strokes WHERE z=? AND tx=? AND ty=? ORDER BY t ASC');
+const selectTileSinceStmt = db.prepare('SELECT json FROM tile_strokes WHERE z=? AND tx=? AND ty=? AND t>? ORDER BY t ASC');
+
+// Database size management - 1GB limit
+const MAX_DB_SIZE_BYTES = 1 * 1024 * 1024 * 1024; // 1GB
+const deleteOldestStrokesStmt = db.prepare('DELETE FROM tile_strokes WHERE rowid IN (SELECT rowid FROM tile_strokes ORDER BY t ASC LIMIT ?)');
+const getDbSizeStmt = db.prepare('SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()');
+const getStrokeCountStmt = db.prepare('SELECT COUNT(*) as count FROM tile_strokes');
 
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -31,33 +58,40 @@ function fileResponse(filePath) {
     : new Response(file);
 }
 
-function tileRawPath(z, tx, ty) {
-  return path.join(LOG_DIR, String(z), `${tx}_${ty}.ndjson`);
-}
-
-function tileGzPath(z, tx, ty) {
-  return path.join(LOG_DIR, String(z), `${tx}_${ty}.ndjson.gz`);
-}
-
-function ensureDirsFor(filePath) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-}
-
-function migrateRawToGz(z, tx, ty) {
-  const raw = tileRawPath(z, tx, ty);
-  const gz = tileGzPath(z, tx, ty);
-  if (fs.existsSync(raw) && !fs.existsSync(gz)) {
-    try {
-      const content = fs.readFileSync(raw);
-      const out = Bun.gzipSync(content, { level: GZIP_LEVEL });
-      ensureDirsFor(gz);
-      fs.writeFileSync(gz, out);
-      fs.unlinkSync(raw);
-    } catch (_) { /* ignore */ }
-  }
-}
+// Legacy file store helpers removed: SQLite is the only storage now.
 
 function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
+
+// Check database size and remove oldest strokes if over limit
+function enforceDbSizeLimit() {
+  try {
+    const sizeResult = getDbSizeStmt.get();
+    const currentSize = sizeResult ? sizeResult.size : 0;
+    
+    if (currentSize >= MAX_DB_SIZE_BYTES) {
+      console.log(`Database size (${Math.round(currentSize / (1024 * 1024))}MB) approaching limit. Cleaning up oldest strokes...`);
+      
+      // Remove oldest 10% of strokes to free up space
+      const countResult = getStrokeCountStmt.get();
+      const totalStrokes = countResult ? countResult.count : 0;
+      
+      if (totalStrokes > 0) {
+        const strokesToDelete = Math.max(1, Math.floor(totalStrokes * 0.1));
+        deleteOldestStrokesStmt.run(strokesToDelete);
+        
+        // Run VACUUM to reclaim space immediately
+        db.exec('VACUUM');
+        
+        const newSizeResult = getDbSizeStmt.get();
+        const newSize = newSizeResult ? newSizeResult.size : 0;
+        
+        console.log(`Cleanup complete. Removed ${strokesToDelete} oldest strokes. Database size reduced from ${Math.round(currentSize / (1024 * 1024))}MB to ${Math.round(newSize / (1024 * 1024))}MB`);
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to enforce database size limit:', error.message);
+  }
+}
 
 export function tilesForBounds(minX, minY, maxX, maxY, tileSize) {
   const tx0 = Math.floor(minX / tileSize);
@@ -90,62 +124,48 @@ function bboxOfPoints(pts) {
 export function appendStrokeToTiles(stroke) {
   const bb = bboxOfPoints(stroke.points || []);
   if (!bb) return [];
+  
+  // Enforce database size limit before adding new strokes
+  enforceDbSizeLimit();
+  
   const padding = clamp(Number(stroke.size) || 12, 1, 128) * 2; // include brush radius
   const tiles = tilesForBounds(bb.minX - padding, bb.minY - padding, bb.maxX + padding, bb.maxY + padding, TILE_SIZE);
   const zVal = stroke.z ?? Z;
-  const line = JSON.stringify(stroke) + "\n";
-  for (const { tx, ty } of tiles) {
-    // Append to raw NDJSON to ensure atomicity and simplicity.
-    // Compression is handled asynchronously or on read via migration.
-    const fRaw = tileRawPath(zVal, tx, ty);
-    ensureDirsFor(fRaw);
-    fs.appendFileSync(fRaw, line, 'utf8');
-  }
+  const DB_GZIP_LEVEL = Number(process.env.DB_GZIP_LEVEL || 9);
+  const jsonBuf = Bun.gzipSync(JSON.stringify(stroke), { level: DB_GZIP_LEVEL });
+  const tVal = Number(stroke.t) || Date.now();
+  const idVal = String(stroke.id || '');
+  const txInsert = db.transaction((list) => {
+    for (const { tx, ty } of list) {
+      insertStrokeStmt.run(zVal, tx, ty, tVal, idVal, jsonBuf);
+    }
+  });
+  try { txInsert(tiles); } catch (e) { console.warn('DB insert failed', (e && e.message) || e); }
   return tiles;
 }
 
-async function gunzipConcatAll(data) {
-  // Use Web DecompressionStream to handle concatenated gzip members
-  try {
-    const ds = new DecompressionStream('gzip');
-    const stream = new Response(new Blob([data]).stream().pipeThrough(ds));
-    const buf = await stream.arrayBuffer();
-    return new TextDecoder('utf-8').decode(buf);
-  } catch (e) {
-    // Fallback to single-member gunzip
-    try { return new TextDecoder('utf-8').decode(Bun.gunzipSync(data)); } catch { return ''; }
-  }
-}
-
 export async function readTileStrokes(z, tx, ty, sinceTs) {
-  const gz = tileGzPath(z, tx, ty);
-  const raw = tileRawPath(z, tx, ty);
-  let text = '';
   try {
-    const parts = [];
-    if (fs.existsSync(gz)) {
-      const data = await fs.promises.readFile(gz);
-      parts.push(await gunzipConcatAll(data));
+    const rows = (sinceTs != null)
+      ? selectTileSinceStmt.all(z, tx, ty, Number(sinceTs))
+      : selectTileAllStmt.all(z, tx, ty);
+    const out = [];
+    for (const r of rows) {
+      try {
+        const data = r.json;
+        if (typeof data === 'string') {
+          out.push(JSON.parse(data));
+        } else if (data && (data instanceof Uint8Array || ArrayBuffer.isView(data))) {
+          const raw = Bun.gunzipSync(data);
+          const str = new TextDecoder('utf-8').decode(raw);
+          out.push(JSON.parse(str));
+        }
+      } catch {}
     }
-    if (fs.existsSync(raw)) {
-      const data = await fs.promises.readFile(raw, 'utf8');
-      parts.push(typeof data === 'string' ? data : data.toString());
-    }
-    if (parts.length === 0) return [];
-    text = parts.join('\n');
+    return out;
   } catch (_) {
     return [];
   }
-  const out = [];
-  for (const line of text.split(/\n+/)) {
-    if (!line.trim()) continue;
-    try {
-      const obj = JSON.parse(line);
-      if (sinceTs && Number(obj.t) <= Number(sinceTs)) continue;
-      out.push(obj);
-    } catch (_) {}
-  }
-  return out;
 }
 const clients = new Map(); // id -> WebSocket
 
@@ -179,6 +199,27 @@ export function startServer(options = {}) {
       return jsonResponse({ ok: true });
     }
 
+    // API: database status
+    if (pathname === '/api/db-status' && req.method === 'GET') {
+      try {
+        const sizeResult = getDbSizeStmt.get();
+        const countResult = getStrokeCountStmt.get();
+        const currentSize = sizeResult ? sizeResult.size : 0;
+        const strokeCount = countResult ? countResult.count : 0;
+        
+        return jsonResponse({
+          sizeBytes: currentSize,
+          sizeMB: Math.round(currentSize / (1024 * 1024)),
+          maxSizeBytes: MAX_DB_SIZE_BYTES,
+          maxSizeMB: Math.round(MAX_DB_SIZE_BYTES / (1024 * 1024)),
+          strokeCount,
+          utilizationPercent: Math.round((currentSize / MAX_DB_SIZE_BYTES) * 100)
+        });
+      } catch (error) {
+        return jsonResponse({ error: 'Failed to get database status', details: error.message }, 500);
+      }
+    }
+
     // API: fetch strokes for a tile
     if (pathname === '/api/tile-strokes' && req.method === 'GET') {
       const z = Number(searchParams.get('z') ?? Z);
@@ -205,7 +246,7 @@ export function startServer(options = {}) {
           t: Date.now(),
           erase: Boolean(json.erase)
         };
-        appendStrokeToTiles(stroke);
+        try { appendStrokeToTiles(stroke); } catch (_) {}
         return jsonResponse({ ok: true, id: stroke.id, t: stroke.t });
       } catch {
         return jsonResponse({ error: 'invalid json' }, 400);
@@ -271,7 +312,7 @@ export function startServer(options = {}) {
           t: now,
           erase: Boolean(payload.erase)
         };
-        appendStrokeToTiles(stroke);
+        try { appendStrokeToTiles(stroke); } catch (_) {}
         broadcast('stroke', stroke, id);
       }
     },
@@ -291,10 +332,39 @@ export function startServer(options = {}) {
     }
   }
   if (!server) throw new Error('Failed to start server');
+  
+  // Set up periodic database monitoring (every 5 minutes)
+  setInterval(() => {
+    try {
+      const sizeResult = getDbSizeStmt.get();
+      const currentSize = sizeResult ? sizeResult.size : 0;
+      const sizeMB = Math.round(currentSize / (1024 * 1024));
+      const utilization = Math.round((currentSize / MAX_DB_SIZE_BYTES) * 100);
+      
+      if (utilization >= 80) {
+        console.log(`Database size warning: ${sizeMB}MB (${utilization}% of 1GB limit)`);
+      }
+    } catch (error) {
+      console.warn('Failed to check database size:', error.message);
+    }
+  }, 5 * 60 * 1000); // 5 minutes
+  
   return server;
 }
 
 if (import.meta.main) {
   const srv = startServer();
   console.log(`Infinite Canvas (Bun) listening on http://localhost:${srv.port}`);
+  
+  // Log initial database status
+  try {
+    const sizeResult = getDbSizeStmt.get();
+    const countResult = getStrokeCountStmt.get();
+    const currentSize = sizeResult ? sizeResult.size : 0;
+    const strokeCount = countResult ? countResult.count : 0;
+    const sizeMB = Math.round(currentSize / (1024 * 1024));
+    console.log(`Database initialized: ${sizeMB}MB used (${strokeCount} strokes), 1GB limit enforced`);
+  } catch (error) {
+    console.warn('Failed to get initial database status:', error.message);
+  }
 }

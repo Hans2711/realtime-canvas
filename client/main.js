@@ -5,14 +5,15 @@ function dlog(...args) { if (DEBUG) console.log('[IC]', ...args); }
 // Extra offscreen pixels around each tile to avoid seam clipping
 const TILE_PAD = 128; // should be >= max brush size
 // Limit maximum zoom-out to reduce tile load
-const MIN_SCALE = 0.13;
+const MIN_SCALE = 0.10;
 const MAX_SCALE = 4;
 const STATE = { dpr: window.devicePixelRatio || 1, showGrid: true };
 const TILE_CACHE_MAX = 256; // allow more tiles in memory while bounded
 
 const canvas = document.getElementById('canvas');
 const overlay = document.getElementById('overlay');
-const ctx = canvas.getContext('2d');
+import { WebGLRenderer } from './webgl.js';
+const renderer = new WebGLRenderer(canvas);
 const octx = overlay.getContext('2d');
 
 // UI elements
@@ -23,7 +24,7 @@ const sizeInput = document.getElementById('size');
 const opacityInput = document.getElementById('opacity');
 const gridToggle = document.getElementById('toggle-grid');
 
-// View transform (world -> screen): setTransform(scale, 0, 0, scale, translateX, translateY)
+// View transform (world -> screen)
 const view = {
   scale: 1,
   tx: 0, // translate x (screen pixels)
@@ -190,6 +191,7 @@ function destroyTile(t) {
       try { layer.canvas.width = 0; layer.canvas.height = 0; } catch {}
     }
   } catch {}
+  if (renderer && renderer.ok()) { try { renderer.disposeTile(t); } catch {} }
   if (t.canvas) { try { t.canvas.width = 0; t.canvas.height = 0; } catch {} }
 }
 
@@ -235,15 +237,12 @@ function compositeTile(tile) {
     tctx.drawImage(layer.canvas, 0, 0);
   }
   tile.dirty = false;
+  // Mark GL texture for upload on next draw
+  tile.glDirty = true;
 }
 
 function worldToScreen(x, y) { return { x: x * view.scale + view.tx, y: y * view.scale + view.ty }; }
 function screenToWorld(x, y) { return { x: (x - view.tx) / view.scale, y: (y - view.ty) / view.scale }; }
-
-function setTransform() {
-  const dpr = STATE.dpr;
-  ctx.setTransform(view.scale * dpr, 0, 0, view.scale * dpr, view.tx * dpr, view.ty * dpr);
-}
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -258,6 +257,7 @@ function resize() {
   canvas.style.height = h + 'px';
   overlay.style.width = w + 'px';
   overlay.style.height = h + 'px';
+  if (renderer && renderer.ok()) renderer.resize(canvas.width, canvas.height);
   requestFrame();
 }
 
@@ -279,11 +279,11 @@ function draw() {
   frameCounter++;
   newTilesThisFrame = 0; // reset per frame so tiles can stream in progressively
   const dpr = STATE.dpr;
-  // Clear entire canvas (device pixels)
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  setTransform();
+  // Clear via WebGL and set view
+  if (renderer && renderer.ok()) {
+    renderer.setView(view.scale, view.tx, view.ty, dpr);
+    renderer.begin(true);
+  }
 
   const cssW = canvas.width / dpr;
   const cssH = canvas.height / dpr;
@@ -311,15 +311,10 @@ function draw() {
         const wx = tx * TILE_SIZE;
         const wy = ty * TILE_SIZE;
         // draw only the inner tile area (crop out padding)
-        ctx.drawImage(t.canvas, t.pad, t.pad, TILE_SIZE, TILE_SIZE, wx, wy, TILE_SIZE, TILE_SIZE);
-        // draw tile border underneath content (if grid enabled)
-        if (STATE.showGrid) {
-          ctx.save();
-          ctx.globalCompositeOperation = 'destination-over';
-          ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-          ctx.lineWidth = 1 / view.scale;
-          ctx.strokeRect(wx, wy, TILE_SIZE, TILE_SIZE);
-          ctx.restore();
+        if (renderer && renderer.ok()) {
+          // Draw border first so it appears underneath content (like destination-over)
+          if (STATE.showGrid) renderer.drawRectOutline(wx, wy, TILE_SIZE, TILE_SIZE, 1 / view.scale, [1, 1, 1, 0.05]);
+          renderer.drawTile(t, wx, wy, TILE_SIZE, TILE_SIZE);
         }
       }
     }
@@ -339,22 +334,14 @@ function draw() {
         compositeTile(t);
         const wx = tx * TILE_SIZE;
         const wy = ty * TILE_SIZE;
-        ctx.drawImage(t.canvas, t.pad, t.pad, TILE_SIZE, TILE_SIZE, wx, wy, TILE_SIZE, TILE_SIZE);
-        if (STATE.showGrid) {
-          ctx.save();
-          ctx.globalCompositeOperation = 'destination-over';
-          ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-          ctx.lineWidth = 1 / view.scale;
-          ctx.strokeRect(wx, wy, TILE_SIZE, TILE_SIZE);
-          ctx.restore();
+        if (renderer && renderer.ok()) {
+          if (STATE.showGrid) renderer.drawRectOutline(wx, wy, TILE_SIZE, TILE_SIZE, 1 / view.scale, [1, 1, 1, 0.05]);
+          renderer.drawTile(t, wx, wy, TILE_SIZE, TILE_SIZE);
         }
   }
     }
-    // Subtle hint in CSS pixels
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = 'rgba(255,255,255,0.8)';
-    ctx.font = '14px system-ui, -apple-system, Segoe UI';
-    ctx.fillText('Showing subset — zoom in for full detail', 16, 48);
+    // Flag to show subset hint in overlay to match original visuals
+    STATE._subsetHint = true;
   }
 
   // Evict far-away/old tiles to bound memory
@@ -366,28 +353,12 @@ function draw() {
 }
 
 function drawBackgroundGrid(w, h) {
+  if (!(renderer && renderer.ok())) return;
   const spacing = TILE_SIZE;
-  const minX = screenToWorld(0, 0).x;
-  const minY = screenToWorld(0, 0).y;
-  const maxX = screenToWorld(w, h).x;
-  const maxY = screenToWorld(w, h).y;
-  const x0 = Math.floor(minX / spacing) * spacing;
-  const y0 = Math.floor(minY / spacing) * spacing;
-  const maxLines = 200;
-  let drawn = 0;
-  ctx.beginPath();
-  for (let x = x0; x <= maxX; x += spacing) {
-    ctx.moveTo(x, minY); ctx.lineTo(x, maxY);
-    drawn++; if (drawn > maxLines) break;
-  }
-  drawn = 0;
-  for (let y = y0; y <= maxY; y += spacing) {
-    ctx.moveTo(minX, y); ctx.lineTo(maxX, y);
-    drawn++; if (drawn > maxLines) break;
-  }
-  ctx.strokeStyle = 'rgba(255,255,255,0.03)';
-  ctx.lineWidth = 1 / view.scale;
-  ctx.stroke();
+  const min = screenToWorld(0, 0);
+  const max = screenToWorld(w, h);
+  const thickness = 1 / view.scale; // 1px in screen space
+  renderer.drawGrid(min.x, min.y, max.x, max.y, spacing, thickness, [1, 1, 1, 0.03]);
 }
 
 function drawOverlay() {
@@ -435,6 +406,16 @@ function drawOverlay() {
     octx.fillText(p.name || id, s.x + 10, s.y - 10);
     octx.restore();
   }
+  // Subset hint text when too many tiles are shown
+  if (STATE._subsetHint) {
+    octx.save();
+    octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    octx.fillStyle = 'rgba(255,255,255,0.8)';
+    octx.font = '14px system-ui, -apple-system, Segoe UI';
+    octx.fillText('Showing subset — zoom in for full detail', 16, 48);
+    octx.restore();
+    STATE._subsetHint = false;
+  }
 }
 
 let raf = null;
@@ -463,6 +444,25 @@ function drawStrokeOnTile(tile, stroke) {
   tctx.stroke();
   tctx.restore();
   tile.dirty = true;
+}
+
+function applyLiveEraserSegment(stroke, p0, p1) {
+  if (!stroke || !stroke.erase) return;
+  const seg = {
+    id: stroke.id,
+    userId: stroke.userId,
+    color: stroke.color,
+    size: stroke.size,
+    opacity: stroke.opacity,
+    erase: true,
+    points: [p0, p1]
+  };
+  const tilesTouched = tilesForStroke(seg);
+  for (const { tx, ty } of tilesTouched) {
+    const t = tryGetTile(tx, ty);
+    if (!t) continue;
+    drawStrokeOnTile(t, seg);
+  }
 }
 
 function tilesForStroke(stroke) {
@@ -731,6 +731,10 @@ canvas.addEventListener('pointermove', (e) => {
     const minDist = 0.5 / Math.max(view.scale, 0.001);
     if (dx*dx + dy*dy >= minDist * minDist) {
       activeStroke.points.push(pt);
+      if (activeStroke.erase && activeStroke.points.length >= 2) {
+        const n = activeStroke.points.length;
+        applyLiveEraserSegment(activeStroke, activeStroke.points[n - 2], activeStroke.points[n - 1]);
+      }
     }
   }
   sendPresence(pt);

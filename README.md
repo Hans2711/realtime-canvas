@@ -3,12 +3,12 @@ Infinite Canvas (MVP)
 Concept: A shared, boundless drawing universe where everyone draws on the same world in real time.
 
 MVP choices
-- Rendering: Canvas2D, tile-based offscreen caches (no external frontend deps).
+- Rendering: WebGL final compositing with 2D offscreen tiles.
 - Realtime: WebSocket broadcast with `ws`.
-- Persistence: Stroke logs per tile as NDJSON (append-only) with optional gzip snapshots.
-  - Hot writes append to `data/tiles/<z>/<tx>_<ty>.ndjson` for reliability.
-  - If a `.ndjson.gz` exists, it is also supported on reads; raw `.ndjson` takes precedence.
-  - A compactor can be added to gzip/rotate old data if needed.
+- Persistence: SQLite (Bun native) per-tile stroke rows (gzip-compressed JSON).
+  - DB file: `data/tiles.sqlite3`
+  - Table: `tile_strokes (z, tx, ty, t, id, json BLOB)` with index on `(z, tx, ty, t)`
+  - Compression: gzip level 9 by default; override with `DB_GZIP_LEVEL`
 - Coordinates: World pixels with origin at (0,0). URL query: `?x=&y=&z=`.
 - Tile size: 1024 px. Zoom is continuous, single resolution for now.
 
