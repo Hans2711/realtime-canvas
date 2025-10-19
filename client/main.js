@@ -13,6 +13,7 @@ const TILE_CACHE_MAX = 256; // allow more tiles in memory while bounded
 const canvas = document.getElementById('canvas');
 const overlay = document.getElementById('overlay');
 import { WebGLRenderer } from './webgl.js';
+import TileManager from './tile-manager.js';
 const renderer = new WebGLRenderer(canvas);
 const octx = overlay.getContext('2d');
 
@@ -483,6 +484,9 @@ function tilesForStroke(stroke) {
 // Service Worker Communication
 let serviceWorker = null;
 let swReady = false;
+// Dedicated worker pool manager (optional). Instantiated on startup to
+// provide parallel tile fetching using multiple dedicated workers.
+let tileManager = null;
 const swMessageId = { current: 0 };
 const swPendingRequests = new Map();
 
@@ -855,7 +859,9 @@ canvas.addEventListener('pointerup', (e) => {
   canvas.releasePointerCapture(e.pointerId);
   pointerId = null;
   if (isPanning) {
+    const wasPanning = isPanning;
     isPanning = false; lastPointer = null;
+    if (wasPanning) trySendPrefetch();
   }
   if (isDrawing && activeStroke) {
     finalizeStroke(activeStroke);
@@ -872,6 +878,8 @@ canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
   const delta = Math.pow(1.0015, -e.deltaY);
   zoomAt(e.clientX, e.clientY, delta);
+  // Ask worker to prefetch tiles for the new view
+  trySendPrefetch();
 }, { passive: false });
 
 // Space to pan
@@ -909,6 +917,24 @@ function finalizeStroke(stroke) {
   }
   sendStroke(stroke);
   requestFrame();
+}
+
+// Send a PREFETCH_TILES message to the service worker (best-effort)
+function trySendPrefetch(radius = 2, z = 0) {
+  try {
+    const dpr = STATE.dpr;
+    const center = screenToWorld((canvas.width / dpr) / 2, (canvas.height / dpr) / 2);
+    const centerTx = Math.floor(center.x / TILE_SIZE);
+    const centerTy = Math.floor(center.y / TILE_SIZE);
+    if (tileManager) {
+      try { tileManager.prefetch(centerTx, centerTy, radius, z); } catch (e) { /* ignore */ }
+      return;
+    }
+    if (swReady && serviceWorker) {
+      // fire-and-forget; service worker will batch internally
+      sendToServiceWorker('PREFETCH_TILES', { centerTx, centerTy, radius, z }).catch(() => {});
+    }
+  } catch (e) { /* ignore */ }
 }
 
 let lastPresenceAt = 0;
@@ -954,12 +980,56 @@ function updateUrlFromView() {
 resize();
 setTool(initialTool);
 loadViewFromUrl();
-initServiceWorker().then(() => {
-  connectWS();
-  // Populate LS for visible tiles at startup (works even if batch API is unavailable)
-  populateVisibleFromServer().finally(() => { requestFrame(); });
-}).catch(() => {
-  // Service worker failed, continue without it
-  connectWS();
-  populateVisibleFromServer().finally(() => { requestFrame(); });
+// Initialize the dedicated TileManager pool first (best-effort). If it is
+// available, we'll use it for batch and prefetch operations. Otherwise we
+// fall back to the service worker path already implemented.
+tileManager = new TileManager({ numWorkers: 4, script: '/tile-worker-thread.js' });
+tileManager.init().catch((err) => {
+  console.warn('TileManager initialization failed, falling back to service worker:', err);
+  tileManager = null;
+}).finally(() => {
+  // Then init service worker and networking
+  initServiceWorker().then(() => {
+    connectWS();
+    // Prefer a single batch restore for all visible tiles via the tileManager
+    (async () => {
+      try {
+        if (tileManager) {
+          const { tx0, ty0, tx1, ty1 } = visibleTileBounds();
+          const tilesList = [];
+          for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) tilesList.push({ tx, ty });
+          if (tilesList.length) {
+            dlog('Batch restore via TileManager', { count: tilesList.length });
+            const res = await tileManager.fetchTilesBatch(0, tilesList);
+            for (const t of (res.tiles || [])) {
+              const arr = Array.isArray(t.strokes) ? t.strokes : [];
+              lsSaveTileStrokes(0, t.tx, t.ty, arr);
+              const key = tileKey(t.tx, t.ty, 0);
+              const tile = tiles.get(key);
+              if (tile) {
+                resetTile(tile);
+                const cached = lsLoadTileStrokes(0, t.tx, t.ty) || [];
+                for (const s of cached) { if (s && s.id) { drawStrokeOnTile(tile, s); tile.seen.add(s.id); tile.cached.push(s); } }
+                tile.dirty = true;
+              }
+            }
+            dlog('Batch restore done via TileManager');
+          }
+        } else {
+          // TileManager unavailable -> use existing worker batch flow
+          await batchFetchVisibleOnce();
+        }
+      } catch (err) {
+        dlog('Batch restore failed; falling back to per-tile population', err);
+        await populateVisibleFromServer();
+      } finally {
+        trySendPrefetch(2, 0);
+        requestFrame();
+      }
+    })();
+  }).catch(() => {
+    // Service worker failed, continue without it
+    connectWS();
+    populateVisibleFromServer().finally(() => { requestFrame(); });
+  });
 });
