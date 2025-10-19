@@ -13,6 +13,39 @@ const TILE_CACHE_MAX = 256; // allow more tiles in memory while bounded
 const canvas = document.getElementById('canvas');
 const overlay = document.getElementById('overlay');
 import { WebGLRenderer } from './webgl.js';
+// Fetcher worker runs network fetches off the main thread
+let fetchWorker = null;
+const _workerPending = new Map(); // id -> {resolve, reject, type}
+function ensureWorker() {
+  if (fetchWorker) return fetchWorker;
+  try {
+    fetchWorker = new Worker(new URL('./fetcher.js', import.meta.url));
+    dlog('Fetch worker created');
+    fetchWorker.addEventListener('error', (err) => {
+      dlog('Fetch worker error, disabling worker fallback', err && err.message);
+      try { fetchWorker.terminate(); } catch {}
+      fetchWorker = null;
+    });
+  } catch (e) {
+    // fallback: worker unsupported, keep null and main thread will fetch
+    fetchWorker = null;
+    return null;
+  }
+  fetchWorker.addEventListener('message', (ev) => {
+    const msg = ev.data || {};
+    const { type } = msg;
+    if (type === 'tileResult') {
+      const { id, tx, ty, z, strokes } = msg;
+      const p = _workerPending.get(id);
+      if (p) { p.resolve(Array.isArray(strokes) ? strokes : []); _workerPending.delete(id); }
+    } else if (type === 'batchResult') {
+      const { id, tiles } = msg;
+      const p = _workerPending.get(id);
+      if (p) { p.resolve(tiles || []); _workerPending.delete(id); }
+    }
+  });
+  return fetchWorker;
+}
 const renderer = new WebGLRenderer(canvas);
 const octx = overlay.getContext('2d');
 
@@ -487,32 +520,37 @@ function tilesForStroke(stroke) {
 
 // Networking
 async function loadTileStrokes(tx, ty, z = 0) {
-  // Debounce tile fetches to avoid spamming the network
-  if (!loadTileStrokes._q) loadTileStrokes._q = new Map();
-  const k = `${z}:${tx}:${ty}`;
-  const q = loadTileStrokes._q;
-  const existing = q.get(k);
-  if (existing && existing.pending) return existing.pending;
-  dlog('Schedule tile fetch', k);
-  let timer = null;
-  const pending = new Promise((resolve, reject) => {
-    timer = setTimeout(async () => {
-      try {
-        const url = `/api/tile-strokes?z=${z}&tx=${tx}&ty=${ty}`;
-        const res = await fetch(url);
-        if (!res.ok) {
-          dlog('Tile fetch failed', { tile: k, status: res.status, statusText: res.statusText });
-          resolve([]);
-          return;
-        }
-        const json = await res.json().catch(() => ({}));
-        resolve(json?.strokes || []);
-      } catch (e) { reject(e); }
-      finally { q.delete(k); }
-    }, 200);
+  // Prefer worker-based fetches when available
+  const worker = ensureWorker();
+  if (!worker) {
+    // fallback to main-thread fetch with debounce
+    if (!loadTileStrokes._q) loadTileStrokes._q = new Map();
+    const k = `${z}:${tx}:${ty}`;
+    const q = loadTileStrokes._q;
+    const existing = q.get(k);
+    if (existing && existing.pending) return existing.pending;
+    dlog('Schedule tile fetch (main)', k);
+    let timer = null;
+    const pending = new Promise((resolve, reject) => {
+      timer = setTimeout(async () => {
+        try {
+          const url = `/api/tile-strokes?z=${z}&tx=${tx}&ty=${ty}`;
+          const res = await fetch(url);
+          if (!res.ok) { resolve([]); return; }
+          const json = await res.json().catch(() => ({}));
+          resolve(json?.strokes || []);
+        } catch (e) { reject(e); }
+        finally { q.delete(k); }
+      }, 200);
+    });
+    q.set(k, { timer, pending });
+    return pending;
+  }
+  const reqId = cryptoId();
+  return new Promise((resolve, reject) => {
+    _workerPending.set(reqId, { resolve, reject, type: 'tile' });
+    try { worker.postMessage({ type: 'fetchTile', id: reqId, tx, ty, z }); } catch (e) { _workerPending.delete(reqId); resolve([]); }
   });
-  q.set(k, { timer, pending });
-  return pending;
 }
 
 // Initial one-shot batch fetch for all visible tiles to quickly restore from server
@@ -536,19 +574,25 @@ async function batchFetchVisibleOnce() {
   if (tilesList.length === 0) return;
   try {
     const z = 0;
-    // Single batch request
     dlog('Batch restore start', { count: tilesList.length, bounds: { tx0, ty0, tx1, ty1 } });
-    const res = await fetch('/api/tile-strokes-batch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ z, tiles: tilesList })
-    });
-    if (!res.ok) {
-      dlog('Batch restore HTTP error', { status: res.status, statusText: res.statusText });
-      throw new Error('batch failed');
+    const worker = ensureWorker();
+    let tilesResp = null;
+    if (worker) {
+      const reqId = cryptoId();
+      tilesResp = await new Promise((resolve) => {
+        _workerPending.set(reqId, { resolve, reject: () => {}, type: 'batch' });
+        try { worker.postMessage({ type: 'batchFetch', id: reqId, z, tiles: tilesList }); } catch (e) { _workerPending.delete(reqId); resolve([]); }
+      });
+    } else {
+      const res = await fetch('/api/tile-strokes-batch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ z, tiles: tilesList })
+      });
+      if (!res.ok) { dlog('Batch restore HTTP error', { status: res.status, statusText: res.statusText }); throw new Error('batch failed'); }
+      const json = await res.json().catch(() => ({}));
+      tilesResp = Array.isArray(json?.tiles) ? json.tiles : [];
     }
-    const json = await res.json();
-    for (const t of json.tiles || []) {
+    for (const t of tilesResp || []) {
       const arr = Array.isArray(t.strokes) ? t.strokes : [];
       // Persist authoritative list in LS for this tile
       lsSaveTileStrokes(z, t.tx, t.ty, arr);
