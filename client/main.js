@@ -102,10 +102,15 @@ function lsSaveTileStrokes(z, tx, ty, arr) {
     const key = lsTileKey(z, tx, ty);
     const json = JSON.stringify(arr || []);
     const idx = lsIndexLoad();
-    localStorage.setItem(key, json);
-    idx[key] = { ts: Date.now(), bytes: lsEstimateBytes(json) };
-    lsIndexSave(idx);
-    lsPrune(LS_BUDGET_BYTES);
+    // Defer actual localStorage writes so they don't block the main flow
+    setTimeout(() => {
+      try {
+        localStorage.setItem(key, json);
+        idx[key] = { ts: Date.now(), bytes: lsEstimateBytes(json) };
+        lsIndexSave(idx);
+        lsPrune(LS_BUDGET_BYTES);
+      } catch (e) { /* ignore storage errors */ }
+    }, 0);
   } catch {}
 }
 function lsLoadTileStrokes(z, tx, ty) {
@@ -570,29 +575,48 @@ async function batchFetchVisibleOnce() {
 async function populateVisibleFromServer() {
   const { tx0, ty0, tx1, ty1 } = visibleTileBounds();
   const z = 0;
-  const tasks = [];
+  // Limit concurrent network activity to avoid blocking rendering
+  const CONCURRENCY = 6;
+  const queue = [];
   for (let ty = ty0; ty <= ty1; ty++) {
     for (let tx = tx0; tx <= tx1; tx++) {
       const k = tileKey(tx, ty, z);
       dlog('Populate LS: schedule', { tile: k });
-      const p = loadTileStrokes(tx, ty, z).then(strokes => {
-        const arr = Array.isArray(strokes) ? strokes : [];
-        // Always write authoritative list to LS
-        lsSaveTileStrokes(z, tx, ty, arr);
-        // If tile object exists, reset and rehydrate strictly from LS
-        const t = tiles.get(k);
-        if (t) {
-          resetTile(t);
-          const cached = lsLoadTileStrokes(z, tx, ty) || [];
-          for (const s of cached) { if (s && s.id) { drawStrokeOnTile(t, s); t.seen.add(s.id); t.cached.push(s); } }
-          t.dirty = true;
-        }
-        dlog('Populate LS: applied', { tile: k, strokes: arr.length });
-      }).catch(err => { dlog('Populate LS: fetch error', { tile: k, err: String(err) }); });
-      tasks.push(p);
+      queue.push({ tx, ty, k });
     }
   }
-  await Promise.all(tasks);
+  const worker = async (item) => {
+    try {
+      const strokes = await loadTileStrokes(item.tx, item.ty, z);
+      const arr = Array.isArray(strokes) ? strokes : [];
+      // Always write authoritative list to LS (deferred inside lsSave)
+      lsSaveTileStrokes(z, item.tx, item.ty, arr);
+      // If tile object exists, reset and rehydrate strictly from LS
+      const t = tiles.get(item.k);
+      if (t) {
+        resetTile(t);
+        const cached = lsLoadTileStrokes(z, item.tx, item.ty) || [];
+        for (const s of cached) { if (s && s.id) { drawStrokeOnTile(t, s); t.seen.add(s.id); t.cached.push(s); } }
+        t.dirty = true;
+      }
+      dlog('Populate LS: applied', { tile: item.k, strokes: arr.length });
+    } catch (err) { dlog('Populate LS: fetch error', { tile: item.k, err: String(err) }); }
+  };
+
+  const runners = [];
+  while (queue.length) {
+    while (runners.length < CONCURRENCY && queue.length) {
+      const item = queue.shift();
+      const p = worker(item).finally(() => {
+        const idx = runners.indexOf(p);
+        if (idx >= 0) runners.splice(idx, 1);
+      });
+      runners.push(p);
+    }
+    // Wait until any runner completes to schedule more
+    if (runners.length) await Promise.race(runners.map(p => p.then(() => {}, () => {})));
+  }
+  await Promise.all(runners);
   dlog('Populate LS: done');
 }
 

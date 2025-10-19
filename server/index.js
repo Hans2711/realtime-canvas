@@ -16,7 +16,12 @@ const Z = 0; // single resolution for MVP
 
 // Initialize SQLite store (Bun native)
 const DB_PATH = path.join(DATA_DIR, 'tiles.sqlite3');
-fs.mkdirSync(DATA_DIR, { recursive: true });
+// Ensure data directory exists without blocking the event loop
+try {
+  await fs.promises.mkdir(DATA_DIR, { recursive: true });
+} catch (e) {
+  // best-effort - if this fails later errors will surface when accessing files
+}
 const db = new Database(DB_PATH);
 db.exec(`
   -- Use in-memory journaling to avoid filesystem restrictions (no -wal/-shm files)
@@ -51,11 +56,14 @@ function jsonResponse(obj, status = 200) {
   });
 }
 
-function fileResponse(filePath) {
-  const file = Bun.file(filePath);
-  return file.size === 0 && !fs.existsSync(filePath)
-    ? new Response('Not Found', { status: 404 })
-    : new Response(file);
+async function fileResponse(filePath) {
+  try {
+    const st = await fs.promises.stat(filePath);
+    if (!st.isFile()) return new Response('Not Found', { status: 404 });
+    return new Response(Bun.file(filePath));
+  } catch (e) {
+    return new Response('Not Found', { status: 404 });
+  }
 }
 
 // Legacy file store helpers removed: SQLite is the only storage now.
@@ -255,13 +263,16 @@ export function startServer(options = {}) {
 
     // Static client
     if (pathname === '/' || pathname === '/index.html') {
-      return fileResponse(path.join(CLIENT_DIR, 'index.html'));
+      return await fileResponse(path.join(CLIENT_DIR, 'index.html'));
     }
     if (pathname && pathname.startsWith('/')) {
       const safePath = path.normalize(path.join(CLIENT_DIR, pathname));
       if (!safePath.startsWith(CLIENT_DIR)) return new Response('Forbidden', { status: 403 });
-      if (fs.existsSync(safePath) && fs.statSync(safePath).isFile()) {
-        return fileResponse(safePath);
+      try {
+        const st = await fs.promises.stat(safePath);
+        if (st.isFile()) return await fileResponse(safePath);
+      } catch (e) {
+        // fallthrough to 404
       }
     }
     return new Response('Not Found', { status: 404 });
