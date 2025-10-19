@@ -5,7 +5,7 @@ function dlog(...args) { if (DEBUG) console.log('[IC]', ...args); }
 // Extra offscreen pixels around each tile to avoid seam clipping
 const TILE_PAD = 128; // should be >= max brush size
 // Limit maximum zoom-out to reduce tile load
-const MIN_SCALE = 0.14;
+const MIN_SCALE = 0.13;
 const MAX_SCALE = 4;
 const STATE = { dpr: window.devicePixelRatio || 1, showGrid: true };
 const TILE_CACHE_MAX = 256; // allow more tiles in memory while bounded
