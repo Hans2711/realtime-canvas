@@ -35,7 +35,8 @@ self.addEventListener('fetch', (ev) => {
               return;
             }
             ws.addEventListener('open', () => {
-              // Send tilesRequest
+              // Identify as tiles channel and then send tilesRequest
+              try { ws.send(JSON.stringify({ type: 'identify', payload: { role: 'tiles' } })); } catch {}
               try {
                 const reqId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
                 ws._reqId = reqId;

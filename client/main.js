@@ -54,8 +54,8 @@ function ensureWorker() {
         const tx = Number(tile.tx);
         const ty = Number(tile.ty);
         const arr = Array.isArray(tile.strokes) ? tile.strokes : [];
-        // Persist authoritative list in LS
-        lsSaveTileStrokes(z, tx, ty, arr);
+        // Persist authoritative list in LS (synchronously so immediate reads see it)
+        try { lsSaveTileStrokesSync(z, tx, ty, arr); } catch (e) {}
         const key = tileKey(tx, ty, z);
         const t = tiles.get(key);
         if (t) {
@@ -171,6 +171,23 @@ function lsSaveTileStrokes(z, tx, ty, arr) {
     }, 0);
   } catch {}
 }
+
+// Synchronous variant used when code needs to read immediately after writing.
+function lsSaveTileStrokesSync(z, tx, ty, arr) {
+  try {
+    const key = lsTileKey(z, tx, ty);
+    const json = JSON.stringify(arr || []);
+    try {
+      localStorage.setItem(key, json);
+    } catch (e) { /* swallow */ }
+    try {
+      const idx = lsIndexLoad();
+      idx[key] = { ts: Date.now(), bytes: lsEstimateBytes(json) };
+      lsIndexSave(idx);
+      lsPrune(LS_BUDGET_BYTES);
+    } catch (e) { /* swallow */ }
+  } catch (e) { /* ignore */ }
+}
 function lsLoadTileStrokes(z, tx, ty) {
   try {
     const key = lsTileKey(z, tx, ty);
@@ -218,8 +235,8 @@ function tryGetTile(tx, ty, z = 0) {
         added++;
       }
       if (added > 0) {
-        // Persist authoritative list first
-        lsSaveTileStrokes(z, tx, ty, t.cached);
+        // Persist authoritative list first (sync so subsequent LS reads see data)
+        try { lsSaveTileStrokesSync(z, tx, ty, t.cached); } catch (e) {}
         // Rehydrate strictly from LS, then render from LS
         const fresh = lsLoadTileStrokes(z, tx, ty) || [];
         resetTile(t);
@@ -547,7 +564,16 @@ function tilesForStroke(stroke) {
 async function loadTileStrokes(tx, ty, z = 0) {
   // Coalesce many per-tile calls into a single batch fetch to reduce RPCs
   const worker = ensureWorker();
-  if (!worker) return [];
+  if (!worker) {
+    // fallback: direct HTTP request for this single tile
+    try {
+      const resp = await fetch(`/api/tile-strokes?z=${encodeURIComponent(z)}&tx=${encodeURIComponent(tx)}&ty=${encodeURIComponent(ty)}`);
+      if (!resp.ok) return [];
+      const json = await resp.json().catch(() => null);
+      if (!json || !Array.isArray(json.strokes)) return [];
+      return json.strokes;
+    } catch (e) { return []; }
+  }
   const key = `${z}:${tx}:${ty}`;
   let entry = _tileBatchQueue.get(key);
   if (!entry) {
@@ -621,23 +647,12 @@ async function batchFetchVisibleOnce() {
   try {
     const z = 0;
     dlog('Batch restore start', { count: tilesList.length, bounds: { tx0, ty0, tx1, ty1 } });
-    const worker = ensureWorker();
-    let tilesResp = [];
-    if (worker) {
-      const reqId = cryptoId();
-      tilesResp = await new Promise((resolve) => {
-        _workerPending.set(reqId, { resolve, reject: () => {}, type: 'batch' });
-        try { worker.postMessage({ type: 'batchFetch', id: reqId, z, tiles: tilesList }); } catch (e) { _workerPending.delete(reqId); resolve([]); }
-      });
-    } else {
-      // No worker => we expect main thread websocket to provide live strokes; return early
-      dlog('Batch restore skipped: no worker available');
-      tilesResp = [];
-    }
+    // Use fetchTilesBatch which handles worker + HTTP fallback
+    const tilesResp = await fetchTilesBatch(tilesList, z);
     for (const t of tilesResp || []) {
       const arr = Array.isArray(t.strokes) ? t.strokes : [];
-      // Persist authoritative list in LS for this tile
-      lsSaveTileStrokes(z, t.tx, t.ty, arr);
+      // Persist authoritative list in LS for this tile (sync so immediate reads see it)
+      lsSaveTileStrokesSync(z, t.tx, t.ty, arr);
       // If we already have the tile object, reset and draw strictly from LS
       const key = tileKey(t.tx, t.ty, z);
       const tile = tiles.get(key);
@@ -668,6 +683,30 @@ async function fetchTilesBatch(tilesList, z = 0) {
   });
 }
 
+// HTTP fallback that posts to server batch endpoint if worker is unavailable
+async function fetchTilesBatchHttp(tilesList, z = 0) {
+  try {
+    const resp = await fetch('/api/tile-strokes-batch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ z, tiles: tilesList }) });
+    if (!resp.ok) return [];
+    const json = await resp.json().catch(() => null);
+    if (!json || !Array.isArray(json.tiles)) return [];
+    return json.tiles.map(t => ({ z: Number(t.z || 0), tx: Number(t.tx), ty: Number(t.ty), strokes: Array.isArray(t.strokes) ? t.strokes : [] }));
+  } catch (e) { return []; }
+}
+
+// Updated fetchTilesBatch to use HTTP fallback when worker is not available or times out
+async function fetchTilesBatchWithFallback(tilesList, z = 0) {
+  const worker = ensureWorker();
+  if (worker) {
+    try {
+      const res = await fetchTilesBatch(tilesList, z);
+      if (Array.isArray(res) && res.length > 0) return res;
+      // fallthrough to HTTP fallback
+    } catch (e) { /* continue to HTTP fallback */ }
+  }
+  return await fetchTilesBatchHttp(tilesList, z);
+}
+
 // Populate/validate localStorage for all visible tiles using chunked batch requests
 async function populateVisibleFromServer() {
   const { tx0, ty0, tx1, ty1 } = visibleTileBounds();
@@ -682,10 +721,11 @@ async function populateVisibleFromServer() {
   for (let i = 0; i < tilesList.length; i += CHUNK) {
     const chunk = tilesList.slice(i, i + CHUNK);
     try {
-      const resp = await fetchTilesBatch(chunk, z);
+      const resp = await fetchTilesBatchWithFallback(chunk, z);
       for (const t of resp || []) {
         const arr = Array.isArray(t.strokes) ? t.strokes : [];
-        lsSaveTileStrokes(z, t.tx, t.ty, arr);
+        // Persist authoritative list synchronously so rehydrate reads succeed immediately
+        try { lsSaveTileStrokesSync(z, t.tx, t.ty, arr); } catch (e) {}
         const key = tileKey(t.tx, t.ty, z);
         const tile = tiles.get(key);
         if (tile) {
@@ -728,6 +768,8 @@ function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
   ws.addEventListener('open', () => { wsReady = true; dlog('WS open'); });
+  // Identify this connection as a peer (broadcast channel)
+  ws.addEventListener('open', () => { try { ws.send(JSON.stringify({ type: 'identify', payload: { role: 'peer' } })); } catch {} });
   ws.addEventListener('close', () => { wsReady = false; dlog('WS close'); setTimeout(connectWS, 1000); });
   ws.addEventListener('message', (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
@@ -915,7 +957,7 @@ let lastPresenceAt = 0;
 function sendPresence(pos) {
   if (!pos) return;
   const now = performance.now();
-  if (now - lastPresenceAt < 50) return; // throttle about 20Hz
+  if (now - lastPresenceAt < 500) return; // throttle to ~2Hz (every 500ms)
   lastPresenceAt = now;
   const msg = { type: 'presence', payload: { x: pos.x, y: pos.y, color: myColor, name: myName } };
   if (wsReady) {

@@ -24,6 +24,8 @@ function ensureWS() {
     return null;
   }
   ws.addEventListener('open', () => { wsReady = true; });
+  // Identify as tiles channel (server -> client streaming for tile data)
+  ws.addEventListener('open', () => { try { ws.send(JSON.stringify({ type: 'identify', payload: { role: 'tiles' } })); } catch {} });
   ws.addEventListener('close', () => { wsReady = false; ws = null; /* reconnect later on demand */ });
   ws.addEventListener('error', () => { /* ignore */ });
   ws.addEventListener('message', (ev) => {

@@ -303,20 +303,9 @@ export function startServer(options = {}) {
   },
   websocket: {
     open(ws) {
-      const id = crypto.randomUUID();
-      const color = `hsl(${Math.floor(Math.random() * 360)}, 80%, 60%)`;
-      const name = `Guest-${id.slice(0, 4)}`;
-      ws.data = { id, color, name, x: 0, y: 0 };
-      clients.set(id, ws);
-
-      // Send welcome + current presence snapshot
-      const snapshot = [];
-      for (const [cid, cws] of clients) {
-        if (cid === id) continue;
-        const d = cws.data;
-        snapshot.push({ id: cid, color: d.color, name: d.name, x: d.x, y: d.y });
-      }
-      ws.send(JSON.stringify({ type: 'welcome', payload: { id, color, name, others: snapshot } }));
+      // Don't assume role on open. Clients must identify as either 'peer' (broadcast
+      // channel for presence/strokes) or 'tiles' (server->client tile streaming).
+      ws.data = { role: null };
     },
   async message(ws, message) {
       let msg;
@@ -327,14 +316,39 @@ export function startServer(options = {}) {
       if (!msg || typeof msg !== 'object') return;
       const { type, payload } = msg;
       const id = ws.data.id;
-      if (type === 'presence') {
+      // Identification: first message should be { type: 'identify', payload: { role: 'peer'|'tiles' } }
+      if (type === 'identify') {
+        const role = payload && payload.role === 'tiles' ? 'tiles' : (payload && payload.role === 'peer' ? 'peer' : null);
+        if (role === 'peer') {
+          // Assign peer identity and add to broadcast list
+          const idNew = crypto.randomUUID();
+          const color = `hsl(${Math.floor(Math.random() * 360)}, 80%, 60%)`;
+          const name = `Guest-${idNew.slice(0, 4)}`;
+          ws.data = { role: 'peer', id: idNew, color, name, x: 0, y: 0 };
+          clients.set(idNew, ws);
+          // Send welcome + current presence snapshot
+          const snapshot = [];
+          for (const [cid, cws] of clients) {
+            if (cid === idNew) continue;
+            const d = cws.data;
+            snapshot.push({ id: cid, color: d.color, name: d.name, x: d.x, y: d.y });
+          }
+          try { ws.send(JSON.stringify({ type: 'welcome', payload: { id: idNew, color, name, others: snapshot } })); } catch {}
+        } else if (role === 'tiles') {
+          ws.data.role = 'tiles';
+        }
+        return;
+      }
+
+      // Only process presence/stroke messages for identified peer connections
+      if (ws.data && ws.data.role === 'peer' && type === 'presence') {
         if (payload && Number.isFinite(payload.x) && Number.isFinite(payload.y)) {
           ws.data.x = Number(payload.x); ws.data.y = Number(payload.y);
         }
         if (payload && typeof payload.name === 'string') ws.data.name = payload.name.slice(0, 24);
         if (payload && typeof payload.color === 'string') ws.data.color = String(payload.color);
         broadcast('presence', { id, x: ws.data.x, y: ws.data.y, color: ws.data.color, name: ws.data.name }, id);
-      } else if (type === 'stroke') {
+      } else if (ws.data && ws.data.role === 'peer' && type === 'stroke') {
         const now = Date.now();
         const stroke = {
           id: payload.id || crypto.randomUUID(),
@@ -353,6 +367,11 @@ export function startServer(options = {}) {
         // Stream tile data back to the requesting socket, one message per tile.
         // payload: { reqId, z, tiles: [{tx,ty}, ...] }
         try {
+          // Only allow tilesRequest from connections that identified as 'tiles'
+          if (!ws.data || ws.data.role !== 'tiles') {
+            // ignore requests from other channels
+            return;
+          }
           const reqId = payload?.reqId || null;
           const zVal = Number(payload?.z ?? Z);
           const tilesArr = Array.isArray(payload?.tiles) ? payload.tiles : [];
