@@ -354,6 +354,33 @@ function zoomAt(screenX, screenY, deltaScale) {
   requestFrame();
 }
 
+// Determine visible tiles for current view
+function visibleTilesList() {
+  const dpr = STATE.dpr;
+  const cssW = canvas.width / dpr;
+  const cssH = canvas.height / dpr;
+  const a = screenToWorld(0, 0);
+  const b = screenToWorld(cssW, cssH);
+  const minX = Math.min(a.x, b.x);
+  const minY = Math.min(a.y, b.y);
+  const maxX = Math.max(a.x, b.x);
+  const maxY = Math.max(a.y, b.y);
+  // Use an epsilon so a boundary that lies exactly on a tile edge
+  // doesn't include the next tile that starts there.
+  const eps = 1e-6;
+  const tx0 = Math.floor(minX / TILE_SIZE);
+  const ty0 = Math.floor(minY / TILE_SIZE);
+  const tx1 = Math.floor((maxX - eps) / TILE_SIZE);
+  const ty1 = Math.floor((maxY - eps) / TILE_SIZE);
+  const out = [];
+  for (let ty = ty0; ty <= ty1; ty++) {
+    for (let tx = tx0; tx <= tx1; tx++) {
+      out.push({ tx, ty });
+    }
+  }
+  return out;
+}
+
 // Determine visible tile range and draw them
 function draw() {
   frameCounter++;
@@ -372,30 +399,21 @@ function draw() {
   if (STATE.showGrid) drawBackgroundGrid(cssW, cssH);
 
   // Visible tiles with guard for extreme zooms
-  const topLeft = screenToWorld(0, 0);
-  const bottomRight = screenToWorld(cssW, cssH);
-  const tx0 = Math.floor(topLeft.x / TILE_SIZE);
-  const ty0 = Math.floor(topLeft.y / TILE_SIZE);
-  const tx1 = Math.floor(bottomRight.x / TILE_SIZE);
-  const ty1 = Math.floor(bottomRight.y / TILE_SIZE);
-  const tilesWide = (tx1 - tx0 + 1);
-  const tilesHigh = (ty1 - ty0 + 1);
+  const vis = visibleTilesList();
   // Cap tiles rendered at extreme zoom-out (lowered for stability)
   const MAX_TILES = 1600; // up to ~40x40 tiles
-  if (tilesWide > 0 && tilesHigh > 0 && tilesWide * tilesHigh <= MAX_TILES) {
-    for (let ty = ty0; ty <= ty1; ty++) {
-      for (let tx = tx0; tx <= tx1; tx++) {
-        const t = tryGetTile(tx, ty);
-        if (!t) continue;
-        compositeTile(t);
-        const wx = tx * TILE_SIZE;
-        const wy = ty * TILE_SIZE;
-        // draw only the inner tile area (crop out padding)
-        if (renderer && renderer.ok()) {
-          // Draw border first so it appears underneath content (like destination-over)
-          if (STATE.showGrid) renderer.drawRectOutline(wx, wy, TILE_SIZE, TILE_SIZE, 1 / view.scale, [1, 1, 1, 0.05]);
-          renderer.drawTile(t, wx, wy, TILE_SIZE, TILE_SIZE);
-        }
+  if (vis.length > 0 && vis.length <= MAX_TILES) {
+    for (const { tx, ty } of vis) {
+      const t = tryGetTile(tx, ty);
+      if (!t) continue;
+      compositeTile(t);
+      const wx = tx * TILE_SIZE;
+      const wy = ty * TILE_SIZE;
+      // draw only the inner tile area (crop out padding)
+      if (renderer && renderer.ok()) {
+        // Draw border first so it appears underneath content (like destination-over)
+        if (STATE.showGrid) renderer.drawRectOutline(wx, wy, TILE_SIZE, TILE_SIZE, 1 / view.scale, [1, 1, 1, 0.05]);
+        renderer.drawTile(t, wx, wy, TILE_SIZE, TILE_SIZE);
       }
     }
   } else {
@@ -418,7 +436,7 @@ function draw() {
           if (STATE.showGrid) renderer.drawRectOutline(wx, wy, TILE_SIZE, TILE_SIZE, 1 / view.scale, [1, 1, 1, 0.05]);
           renderer.drawTile(t, wx, wy, TILE_SIZE, TILE_SIZE);
         }
-  }
+      }
     }
     // Flag to show subset hint in overlay to match original visuals
     STATE._subsetHint = true;
@@ -632,17 +650,21 @@ function visibleTileBounds() {
   const cssH = canvas.height / dpr;
   const tl = screenToWorld(0, 0);
   const br = screenToWorld(cssW, cssH);
-  const tx0 = Math.floor(tl.x / TILE_SIZE);
-  const ty0 = Math.floor(tl.y / TILE_SIZE);
-  const tx1 = Math.floor(br.x / TILE_SIZE);
-  const ty1 = Math.floor(br.y / TILE_SIZE);
+  const minX = Math.min(tl.x, br.x);
+  const minY = Math.min(tl.y, br.y);
+  const maxX = Math.max(tl.x, br.x);
+  const maxY = Math.max(tl.y, br.y);
+  const eps = 1e-6;
+  const tx0 = Math.floor(minX / TILE_SIZE);
+  const ty0 = Math.floor(minY / TILE_SIZE);
+  const tx1 = Math.floor((maxX - eps) / TILE_SIZE);
+  const ty1 = Math.floor((maxY - eps) / TILE_SIZE);
   return { tx0, ty0, tx1, ty1 };
 }
 
 async function batchFetchVisibleOnce() {
-  const { tx0, ty0, tx1, ty1 } = visibleTileBounds();
-  const tilesList = [];
-  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) tilesList.push({ tx, ty });
+  // Use same logic as draw()
+  const tilesList = visibleTilesList();
   if (tilesList.length === 0) return;
   try {
     const z = 0;
@@ -709,10 +731,9 @@ async function fetchTilesBatchWithFallback(tilesList, z = 0) {
 
 // Populate/validate localStorage for all visible tiles using chunked batch requests
 async function populateVisibleFromServer() {
-  const { tx0, ty0, tx1, ty1 } = visibleTileBounds();
   const z = 0;
-  const tilesList = [];
-  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) tilesList.push({ tx, ty });
+  // Use the same robust visibility used for drawing
+  const tilesList = visibleTilesList();
   if (tilesList.length === 0) return;
   dlog('Populate LS: batches', { count: tilesList.length });
 
