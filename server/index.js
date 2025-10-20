@@ -1,4 +1,4 @@
-// Bun-native HTTP + WebSocket server for Infinite Canvas MVP
+// Bun-native HTTP + WebSocket server for Realtime Canvas MVP
 // - Serves static client via Bun.file/Response
 // - WebSockets via Bun.serve websocket handlers
 // - Persists stroke logs per tile as NDJSON.gz (appendable gzip members)
@@ -455,7 +455,7 @@ export function startServer(options = {}) {
 
 if (import.meta.main) {
   const srv = startServer();
-  console.log(`Infinite Canvas (Bun) listening on http://localhost:${srv.port}`);
+  console.log(`Realtime Canvas (Bun) listening on http://localhost:${srv.port}`);
   
   // Log initial database status
   try {

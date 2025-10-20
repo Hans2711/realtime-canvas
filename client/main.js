@@ -502,8 +502,8 @@ function drawOverlay() {
   octx.clearRect(0, 0, overlay.width, overlay.height);
   octx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  // In-progress stroke preview
-  if (activeStroke && activeStroke.points.length > 1) {
+  // In-progress stroke preview (smoothed)
+  if (activeStroke && activeStroke.points.length > 0) {
     octx.save();
     octx.globalAlpha = activeStroke.opacity;
     octx.lineCap = 'round';
@@ -511,15 +511,17 @@ function drawOverlay() {
     octx.lineWidth = activeStroke.size * view.scale;
     octx.strokeStyle = activeStroke.erase ? 'rgba(0,0,0,1)' : activeStroke.color;
     if (activeStroke.erase) octx.globalCompositeOperation = 'destination-out';
-    if (activeStroke.points.length) {
+    const pts = activeStroke.points.map(p => worldToScreen(p.x, p.y));
+    if (pts.length === 1) {
+      const r = (activeStroke.size * view.scale) / 2;
+      const c = pts[0];
       octx.beginPath();
-      const first = worldToScreen(activeStroke.points[0].x, activeStroke.points[0].y);
-      octx.moveTo(first.x, first.y);
-      for (let i = 1; i < activeStroke.points.length; i++) {
-        const p = activeStroke.points[i];
-        const s = worldToScreen(p.x, p.y);
-        octx.lineTo(s.x, s.y);
-      }
+      octx.arc(c.x, c.y, r, 0, Math.PI * 2);
+      // Use fill for single-point to create a round dab
+      octx.fillStyle = activeStroke.erase ? 'rgba(0,0,0,1)' : activeStroke.color;
+      octx.fill();
+    } else {
+      drawSmoothPath2D(octx, pts);
       octx.stroke();
     }
     octx.restore();
@@ -570,15 +572,51 @@ function drawStrokeOnTile(tile, stroke) {
   const erase = Boolean(stroke.erase);
   tctx.globalCompositeOperation = erase ? 'destination-out' : 'source-over';
   tctx.strokeStyle = stroke.color || '#000';
-  tctx.beginPath();
   const pts = stroke.points || [];
-  for (let i = 0; i < pts.length; i++) {
-    const p = pts[i];
-    if (i === 0) tctx.moveTo(p.x, p.y); else tctx.lineTo(p.x, p.y);
+  if (pts.length === 1) {
+    const p = pts[0];
+    const r = (Number(stroke.size) || 4) / 2;
+    tctx.beginPath();
+    tctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    // Fill to create a round dab for single-point strokes
+    tctx.fillStyle = stroke.color || '#000';
+    tctx.fill();
+  } else if (pts.length > 1) {
+    drawSmoothPath2D(tctx, pts);
+    tctx.stroke();
   }
-  tctx.stroke();
   tctx.restore();
   tile.dirty = true;
+}
+
+// Draw a smoothed path using quadratic curves through midpoints
+function drawSmoothPath2D(ctx, pts) {
+  if (!Array.isArray(pts) || pts.length === 0) return;
+  if (pts.length === 1) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    ctx.lineTo(pts[0].x, pts[0].y);
+    return;
+  }
+  if (pts.length === 2) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    ctx.lineTo(pts[1].x, pts[1].y);
+    return;
+  }
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p = pts[i];
+    const next = pts[i + 1];
+    const mx = (p.x + next.x) / 2;
+    const my = (p.y + next.y) / 2;
+    ctx.quadraticCurveTo(p.x, p.y, mx, my);
+  }
+  // last segment
+  const pPrev = pts[pts.length - 2];
+  const pLast = pts[pts.length - 1];
+  ctx.quadraticCurveTo(pPrev.x, pPrev.y, pLast.x, pLast.y);
 }
 
 function applyLiveEraserSegment(stroke, p0, p1) {
@@ -1042,8 +1080,24 @@ function pathDataFromPoints(pts) {
     const v = Math.round(Number(n) * 100) / 100; // 2dp to keep size small
     return Number.isFinite(v) ? String(v) : '0';
   };
+  if (pts.length === 1) {
+    const p = pts[0];
+    return `M ${f(p.x)} ${f(p.y)}`;
+  }
+  if (pts.length === 2) {
+    return `M ${f(pts[0].x)} ${f(pts[0].y)} L ${f(pts[1].x)} ${f(pts[1].y)}`;
+  }
   let d = `M ${f(pts[0].x)} ${f(pts[0].y)}`;
-  for (let i = 1; i < pts.length; i++) d += ` L ${f(pts[i].x)} ${f(pts[i].y)}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p = pts[i];
+    const n = pts[i + 1];
+    const mx = (Number(p.x) + Number(n.x)) / 2;
+    const my = (Number(p.y) + Number(n.y)) / 2;
+    d += ` Q ${f(p.x)} ${f(p.y)} ${f(mx)} ${f(my)}`;
+  }
+  const pPrev = pts[pts.length - 2];
+  const pLast = pts[pts.length - 1];
+  d += ` Q ${f(pPrev.x)} ${f(pPrev.y)} ${f(pLast.x)} ${f(pLast.y)}`;
   return d;
 }
 
@@ -1142,12 +1196,18 @@ async function exportVisibleAreaToSvg() {
     parts.push(`<rect x="${minX}" y="${minY}" width="${W}" height="${H}" fill="white"/>`);
     for (let j = i; j < erasers.length; j++) {
       const e = erasers[j];
-      const d = pathDataFromPoints(e.points);
-      if (!d) continue;
+      const pts = Array.isArray(e.points) ? e.points : [];
       const sw = Number(e.size) || 4;
       const op = Number.isFinite(e.opacity) ? e.opacity : 1;
-      // Black in mask removes content
-      parts.push(`<path d="${d}" fill="none" stroke="black" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="${op}"/>`);
+      if (pts.length === 1) {
+        const p = pts[0];
+        parts.push(`<circle cx="${p.x}" cy="${p.y}" r="${sw / 2}" fill="black" fill-opacity="${op}"/>`);
+      } else {
+        const d = pathDataFromPoints(pts);
+        if (!d) continue;
+        // Black in mask removes content
+        parts.push(`<path d="${d}" fill="none" stroke="black" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="${op}"/>`);
+      }
     }
     masks.push(`<mask id="${maskIdForIndex(i)}" maskUnits="userSpaceOnUse" x="${minX}" y="${minY}" width="${W}" height="${H}">${parts.join('')}</mask>`);
   }
@@ -1172,19 +1232,25 @@ async function exportVisibleAreaToSvg() {
   const bodyParts = [];
 
   for (const s of paints) {
-    const d = pathDataFromPoints(s.points);
-    if (!d) continue;
+    const pts = Array.isArray(s.points) ? s.points : [];
     const sw = Number(s.size) || 4;
     const color = String(s.color || '#000');
     const op = Number.isFinite(s.opacity) ? s.opacity : 1;
     const idx = firstEraserAfter(Number(s.t));
     const maskAttr = erasers.length && idx < erasers.length ? ` mask="url(#${maskIdForIndex(idx)})"` : '';
-    bodyParts.push(`<g${maskAttr}><path d="${d}" fill="none" stroke="${color}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="${op}"/></g>`);
+    if (pts.length === 1) {
+      const p = pts[0];
+      bodyParts.push(`<g${maskAttr}><circle cx="${p.x}" cy="${p.y}" r="${sw / 2}" fill="${color}" fill-opacity="${op}"/></g>`);
+    } else {
+      const d = pathDataFromPoints(pts);
+      if (!d) continue;
+      bodyParts.push(`<g${maskAttr}><path d="${d}" fill="none" stroke="${color}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="${op}"/></g>`);
+    }
   }
 
   const svg = `${header}\n${svgOpen}${defs}${bodyParts.join('')}</svg>`;
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  exportFile(`infinite-canvas-${ts}.svg`, svg);
+  exportFile(`realtime-canvas-${ts}.svg`, svg);
 }
 
 function finalizeStroke(stroke) {

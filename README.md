@@ -1,4 +1,4 @@
-Infinite Canvas (MVP)
+Realtime Canvas (MVP)
 
 Concept: A shared, boundless drawing universe where everyone draws on the same world in real time.
 

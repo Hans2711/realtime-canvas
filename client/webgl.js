@@ -1,4 +1,4 @@
-// Minimal WebGL1 renderer for Infinite Canvas tiles + grid
+// Minimal WebGL1 renderer for Realtime Canvas tiles + grid
 // Draws:
 // - Textured quads for tile bitmaps (from 2D offscreen canvases)
 // - Solid-color quads for grid lines and tile borders
@@ -282,4 +282,3 @@ export class WebGLRenderer {
     return prog;
   }
 }
-
