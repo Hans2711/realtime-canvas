@@ -5,6 +5,11 @@
   --muted: #9aa4b2;
   --accent: #6aa5ff;
   --border: #2a2f3a;
+  /* Safe-area insets for mobile browsers */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
 }
 
 html, body {
@@ -13,6 +18,10 @@ html, body {
   background: var(--bg);
   color: var(--text);
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Prevent scroll chaining and browser pull-to-refresh over canvas */
+  overscroll-behavior: none;
 }
 
 #ui {
@@ -23,9 +32,10 @@ html, body {
 
 .toolbar {
   display: flex;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 10px 12px; /* row/column gap */
   align-items: center;
-  padding: 10px 12px;
+  padding: calc(8px + var(--safe-top)) 12px 8px 12px;
   background: linear-gradient(180deg, rgba(23,26,34,0.9), rgba(23,26,34,0.6));
   border-bottom: 1px solid var(--border);
   backdrop-filter: blur(6px);
@@ -36,7 +46,9 @@ html, body {
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 6px 10px;
+  padding: 8px 12px;
+  min-height: 36px;
+  min-width: 44px; /* better touch target */
   cursor: pointer;
 }
 .toolbar .tool.active {
@@ -50,6 +62,7 @@ html, body {
 
 .toolbar input[type="range"] {
   vertical-align: middle;
+  width: 160px;
 }
 
 .toolbar .hint {
@@ -57,14 +70,51 @@ html, body {
   margin-left: auto;
 }
 
+.toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 #stage {
-  position: absolute; inset: 0;
+  position: absolute;
+  left: 0; right: 0; bottom: 0; top: 0;
 }
 
 #canvas, #overlay {
   position: absolute; left: 0; top: 0; width: 100%; height: 100%;
   display: block;
+  /* Ensure our pointer handling owns touch interactions */
+  touch-action: none;
+  -webkit-tap-highlight-color: rgba(0,0,0,0);
 }
 
 #overlay { pointer-events: none; }
 
+/*
+  Responsive tweaks
+*/
+@media (max-width: 1024px) {
+  .toolbar input[type="range"] { width: 140px; }
+}
+
+@media (max-width: 768px) {
+  .toolbar { gap: 8px 10px; }
+  .toolbar input[type="range"] { width: 120px; }
+  .toolbar .hint { display: none; }
+  /* On small screens, avoid covering canvas with toolbar */
+  #stage { top: var(--ui-offset, 0px); }
+}
+
+@media (max-width: 480px) {
+  .toolbar {
+    /* Allow horizontal scrolling if wrapping still overflows */
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .toolbar input[type="range"] { width: 100px; }
+  .toolbar .tool { padding: 8px 10px; min-height: 34px; }
+}

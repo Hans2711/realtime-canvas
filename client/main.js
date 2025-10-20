@@ -12,6 +12,7 @@ const TILE_CACHE_MAX = 256; // allow more tiles in memory while bounded
 
 const canvas = document.getElementById('canvas');
 const overlay = document.getElementById('overlay');
+const toolbarEl = document.querySelector('.toolbar');
 import { WebGLRenderer } from './webgl.js';
 // Fetcher worker runs network fetches off the main thread
 let fetchWorker = null;
@@ -75,12 +76,15 @@ const renderer = new WebGLRenderer(canvas);
 const octx = overlay.getContext('2d');
 
 // UI elements
+const toolPanBtn = document.getElementById('tool-pan');
 const toolPenBtn = document.getElementById('tool-pen');
 const toolEraserBtn = document.getElementById('tool-eraser');
 const colorInput = document.getElementById('color');
 const sizeInput = document.getElementById('size');
 const opacityInput = document.getElementById('opacity');
 const gridToggle = document.getElementById('toggle-grid');
+const zoomInBtn = document.getElementById('zoom-in');
+const zoomOutBtn = document.getElementById('zoom-out');
 
 // View transform (world -> screen)
 const view = {
@@ -90,7 +94,7 @@ const view = {
 };
 
 // State
-let tool = 'pen'; // 'pen' | 'eraser'
+let tool = 'pen'; // 'pen' | 'eraser' | 'pan'
 let isPanning = false;
 let isDrawing = false;
 let spaceHeld = false;
@@ -116,7 +120,7 @@ if (savedOpacity) {
   const n = Math.max(0.1, Math.min(1, Number(savedOpacity)));
   if (Number.isFinite(n)) opacityInput.value = String(n);
 }
-const initialTool = (localStorage.getItem('tool') === 'eraser') ? 'eraser' : 'pen';
+const initialTool = (['eraser','pan'].includes(localStorage.getItem('tool'))) ? localStorage.getItem('tool') : 'pen';
 let myName = null;
 let ws = null;
 let wsReady = false;
@@ -324,7 +328,18 @@ function compositeTile(tile) {
 function worldToScreen(x, y) { return { x: x * view.scale + view.tx, y: y * view.scale + view.ty }; }
 function screenToWorld(x, y) { return { x: (x - view.tx) / view.scale, y: (y - view.ty) / view.scale }; }
 
+function updateUiOffsetVar() {
+  try {
+    if (!toolbarEl) return;
+    const rect = toolbarEl.getBoundingClientRect();
+    const offset = Math.max(0, Math.ceil(rect.bottom));
+    document.documentElement.style.setProperty('--ui-offset', offset + 'px');
+  } catch {}
+}
+
 function resize() {
+  // Update stage top offset for small screens before measuring canvas size
+  updateUiOffsetVar();
   const dpr = window.devicePixelRatio || 1;
   STATE.dpr = dpr;
   const w = canvas.clientWidth || window.innerWidth;
@@ -342,6 +357,13 @@ function resize() {
 }
 
 window.addEventListener('resize', resize);
+// Improve mobile behavior: react to dynamic viewport changes (iOS URL bar, etc.)
+try {
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', resize);
+    window.visualViewport.addEventListener('scroll', resize);
+  }
+} catch {}
 
 // Zoom around a screen point
 function zoomAt(screenX, screenY, deltaScale) {
@@ -352,6 +374,13 @@ function zoomAt(screenX, screenY, deltaScale) {
   view.ty = screenY - before.y * view.scale;
   updateUrlFromView();
   requestFrame();
+}
+
+function zoomToCenter(deltaScale) {
+  const dpr = STATE.dpr;
+  const cssW = canvas.width / dpr;
+  const cssH = canvas.height / dpr;
+  zoomAt(cssW / 2, cssH / 2, deltaScale);
 }
 
 // Determine visible tiles for current view
@@ -830,6 +859,7 @@ function connectWS() {
 }
 
 // UI handlers
+toolPanBtn.addEventListener('click', () => setTool('pan'));
 toolPenBtn.addEventListener('click', () => setTool('pen'));
 toolEraserBtn.addEventListener('click', () => setTool('eraser'));
 colorInput.addEventListener('input', () => {
@@ -852,6 +882,7 @@ opacityInput.addEventListener('input', () => {
 
 function setTool(t) {
   tool = t;
+  toolPanBtn.classList.toggle('active', t === 'pan');
   toolPenBtn.classList.toggle('active', t === 'pen');
   toolEraserBtn.classList.toggle('active', t === 'eraser');
   try { localStorage.setItem('tool', tool); } catch {}
@@ -862,7 +893,7 @@ canvas.addEventListener('pointerdown', (e) => {
   if (pointerId !== null) return;
   canvas.setPointerCapture(e.pointerId);
   pointerId = e.pointerId;
-  const isPanMode = spaceHeld || e.button === 1 || (tool !== 'pen' && tool !== 'eraser');
+  const isPanMode = spaceHeld || e.button === 1 || tool === 'pan' || (tool !== 'pen' && tool !== 'eraser');
   const world = screenToWorld(e.clientX, e.clientY);
   if (isPanMode) {
     isPanning = true;
@@ -956,6 +987,10 @@ if (gridToggle) {
     requestFrame();
   });
 }
+
+// Zoom buttons (helpful on mobile where wheel isn't available)
+if (zoomInBtn) zoomInBtn.addEventListener('click', () => zoomToCenter(1.15));
+if (zoomOutBtn) zoomOutBtn.addEventListener('click', () => zoomToCenter(1 / 1.15));
 
 function finalizeStroke(stroke) {
   // Draw onto tile canvases then broadcast/persist
