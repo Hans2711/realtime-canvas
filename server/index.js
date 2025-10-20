@@ -10,6 +10,8 @@ import { Database } from 'bun:sqlite';
 const PORT = Number(process.env.PORT || 3000);
 const ROOT = path.resolve(import.meta.dir, '..');
 const CLIENT_DIR = path.join(ROOT, 'client');
+const CLIENT_DIST_DIR = path.join(CLIENT_DIR, 'dist');
+const CLIENT_PUBLIC_DIR = path.join(CLIENT_DIR, 'public');
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
 const TILE_SIZE = 1024; // px
 const Z = 0; // single resolution for MVP
@@ -285,19 +287,47 @@ export function startServer(options = {}) {
       }
     }
 
-    // Static client
-    if (pathname === '/' || pathname === '/index.html') {
-      return await fileResponse(path.join(CLIENT_DIR, 'index.html'));
-    }
-    if (pathname && pathname.startsWith('/')) {
-      const safePath = path.normalize(path.join(CLIENT_DIR, pathname));
-      if (!safePath.startsWith(CLIENT_DIR)) return new Response('Forbidden', { status: 403 });
-      try {
-        const st = await fs.promises.stat(safePath);
-        if (st.isFile()) return await fileResponse(safePath);
-      } catch (e) {
-        // fallthrough to 404
+    // Static client (prefer built assets under client/dist if present)
+    const tryStatic = async (rel) => {
+      // sanitize path
+      const normalizedRel = path.normalize(rel).replace(/^\/+/, '');
+      // 1) Try dist
+      const distPath = path.join(CLIENT_DIST_DIR, normalizedRel);
+      const distSafe = path.normalize(distPath);
+      if (distSafe.startsWith(CLIENT_DIST_DIR)) {
+        try {
+          const st = await fs.promises.stat(distSafe);
+          if (st.isFile()) return await fileResponse(distSafe);
+        } catch {}
       }
+      // 2) Try client/public (for assets like sw.js during dev)
+      const pubPath = path.join(CLIENT_PUBLIC_DIR, normalizedRel);
+      const pubSafe = path.normalize(pubPath);
+      if (pubSafe.startsWith(CLIENT_PUBLIC_DIR)) {
+        try {
+          const st = await fs.promises.stat(pubSafe);
+          if (st.isFile()) return await fileResponse(pubSafe);
+        } catch {}
+      }
+
+      // 3) Fallback to client source
+      const srcPath = path.join(CLIENT_DIR, normalizedRel);
+      const srcSafe = path.normalize(srcPath);
+      if (!srcSafe.startsWith(CLIENT_DIR)) return new Response('Forbidden', { status: 403 });
+      try {
+        const st = await fs.promises.stat(srcSafe);
+        if (st.isFile()) return await fileResponse(srcSafe);
+      } catch {}
+      return null;
+    };
+
+    // index
+    if (pathname === '/' || pathname === '/index.html') {
+      const res = await tryStatic('index.html');
+      if (res) return res;
+    } else if (pathname && pathname.startsWith('/')) {
+      const res = await tryStatic(pathname);
+      if (res) return res;
     }
     return new Response('Not Found', { status: 404 });
   },

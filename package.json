@@ -7,7 +7,13 @@
   "scripts": {
     "start": "bun server/index.js",
     "dev": "bun --watch server/index.js",
+    "dev:client": "vite",
+    "build:client": "vite build",
+    "preview:client": "vite preview",
     "test": "bun test"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
   },
   "dependencies": {},
   "engines": {

@@ -12,4 +12,5 @@ yarn-error.log*
 
 # Data
 data/
+client/dist
 

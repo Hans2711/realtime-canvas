@@ -215,6 +215,10 @@ let frameCounter = 0;
 const NEW_TILE_BUDGET = 256; // tiles can stream in faster per frame
 let newTilesThisFrame = 0;
 
+// Track visibility between frames to trigger server re-checks
+let _prevVisibleKeys = new Set();
+const VISIBLE_RECHECK_DEBOUNCE_MS = 300; // avoid immediate duplicate checks when a tile is first created
+
 function tileKey(tx, ty, z = 0) { return `${z}:${tx}:${ty}`; }
 
 function tryGetTile(tx, ty, z = 0) {
@@ -237,6 +241,7 @@ function tryGetTile(tx, ty, z = 0) {
       t.loaded = true;
     }
     // Then lazy load strokes from server and merge only new ones
+    t._lastFetchAt = performance.now();
     loadTileStrokes(tx, ty, z).then(strokes => {
       dlog('HTTP restore result', { tile: key, strokes: (strokes||[]).length });
       let added = 0;
@@ -478,6 +483,30 @@ function draw() {
     // Flag to show subset hint in overlay to match original visuals
     STATE._subsetHint = true;
   }
+
+  // After drawing, trigger a websocket re-check for any tiles that just became visible
+  try {
+    const now = performance.now();
+    const currentKeys = new Set();
+    const entered = [];
+    for (const { tx, ty } of vis) {
+      const key = tileKey(tx, ty, 0);
+      currentKeys.add(key);
+      if (!_prevVisibleKeys.has(key)) {
+        const t = tiles.get(key);
+        // If the tile object exists and wasn't just fetched, re-check via WS
+        if (t && !(t._lastFetchAt && (now - t._lastFetchAt) < VISIBLE_RECHECK_DEBOUNCE_MS)) {
+          entered.push({ tx, ty });
+          t._lastFetchAt = now;
+        }
+      }
+    }
+    _prevVisibleKeys = currentKeys;
+    if (entered.length) {
+      // Use the worker websocket path; incremental updates arrive as batchTile messages
+      try { fetchTilesBatch(entered, 0).catch(() => {}); } catch {}
+    }
+  } catch {}
 
   // Evict far-away/old tiles to bound memory
   const centerWorld2 = screenToWorld(cssW / 2, cssH / 2);
