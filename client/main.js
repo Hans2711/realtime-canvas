@@ -746,12 +746,9 @@ async function populateVisibleFromServer() {
 }
 
 function sendStroke(stroke) {
-  // compact stroke: [2, id, userId, color, size, opacity, eraseFlag, ptsFlat]
-  const ptsFlat = [];
-  for (const p of stroke.points || []) { ptsFlat.push(Number(p.x)); ptsFlat.push(Number(p.y)); }
-  const arr = [2, stroke.id, stroke.userId || '', stroke.color || '#000', stroke.size || 12, stroke.opacity || 1, stroke.erase ? 1 : 0, ptsFlat];
+  const msg = { type: 'stroke', payload: stroke };
   if (wsReady) {
-    try { ws.send(JSON.stringify(arr)); return; } catch {}
+    try { ws.send(JSON.stringify(msg)); return; } catch {}
   }
   // fallback to HTTP
   // Debounce persist calls slightly so quick successive finalize events don't spam
@@ -771,50 +768,16 @@ function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
   ws.addEventListener('open', () => { wsReady = true; dlog('WS open'); });
-  // Identify this connection as a peer (compact: [0, roleCode]) where 0=peer
-  ws.addEventListener('open', () => { try { ws.send(JSON.stringify([0, 0])); } catch {} });
+  // Identify this connection as a peer (broadcast channel)
+  ws.addEventListener('open', () => { try { ws.send(JSON.stringify({ type: 'identify', payload: { role: 'peer' } })); } catch {} });
   ws.addEventListener('close', () => { wsReady = false; dlog('WS close'); setTimeout(connectWS, 1000); });
   ws.addEventListener('message', (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     const { type, payload } = msg || {};
-    // Support compact array messages as well as legacy objects
-    if (Array.isArray(msg)) {
-      const op = msg[0];
-      if (op === 5) {
-        // welcome: [5, id, color, name, [[id,x,y],...]]
-        myId = msg[1]; myName = msg[3];
-        const others = Array.isArray(msg[4]) ? msg[4] : [];
-        for (const o of others) { peers.set(o[0], { x: o[1], y: o[2] }); }
-        const center = screenToWorld((canvas.width / STATE.dpr) / 2, (canvas.height / STATE.dpr) / 2);
-        sendPresence(center);
-        dlog('WS welcome (compact)', { peers: others.length, id: myId });
-        requestFrame();
-      } else if (op === 1) {
-        // presence: [1, id, x, y, color?, name?]
-        const id = msg[1]; const x = msg[2]; const y = msg[3]; const color = msg[4]; const name = msg[5];
-        peers.set(id, { ...(peers.get(id) || {}), x, y, color, name }); requestFrame();
-      } else if (op === 2) {
-        // stroke: [2, id, userId, color, size, opacity, eraseFlag, ptsFlat]
-        const id = msg[1]; const userId = msg[2]; const color = msg[3]; const size = msg[4]; const opacity = msg[5]; const erase = !!msg[6]; const ptsFlat = Array.isArray(msg[7]) ? msg[7] : [];
-        const pts = []; for (let i=0;i<ptsFlat.length;i+=2) pts.push({ x: ptsFlat[i], y: ptsFlat[i+1] });
-        const stroke = { id, userId, color, size, opacity, erase, points: pts };
-        dlog('WS stroke (compact)', { id, points: pts.length });
-        const tilesTouched = tilesForStroke(stroke);
-        for (const { tx, ty } of tilesTouched) {
-          const t = tryGetTile(tx, ty); if (!t) continue; if (!t.seen.has(stroke.id)) { drawStrokeOnTile(t, stroke); t.seen.add(stroke.id); t.cached.push(stroke); lsSaveTileStrokes(0, tx, ty, t.cached); }
-        }
-        requestFrame();
-      } else if (op === 6) {
-        // tileBatchDone - ignore on peer socket
-      } else if (op === 7) {
-        const id = msg[1]; peers.delete(id); requestFrame();
-      }
-      return;
-    }
-
     if (type === 'welcome') {
       myId = payload.id; myName = payload.name;
       for (const p of payload.others || []) { peers.set(p.id, p); }
+      // Sync our current picker color to presence immediately
       const center = screenToWorld((canvas.width / STATE.dpr) / 2, (canvas.height / STATE.dpr) / 2);
       sendPresence(center);
       dlog('WS welcome', { peers: (payload.others||[]).length, id: myId });
@@ -827,6 +790,7 @@ function connectWS() {
       peers.delete(payload.id);
       requestFrame();
     } else if (type === 'stroke') {
+      // Draw onto tiles
       dlog('WS stroke', { id: payload?.id, points: payload?.points?.length || 0 });
       const tilesTouched = tilesForStroke(payload);
       for (const { tx, ty } of tilesTouched) {
@@ -995,9 +959,9 @@ function sendPresence(pos) {
   const now = performance.now();
   if (now - lastPresenceAt < 500) return; // throttle to ~2Hz (every 500ms)
   lastPresenceAt = now;
-  const arr = [1, pos.x, pos.y, myColor, myName];
+  const msg = { type: 'presence', payload: { x: pos.x, y: pos.y, color: myColor, name: myName } };
   if (wsReady) {
-    try { ws.send(JSON.stringify(arr)); } catch {}
+    try { ws.send(JSON.stringify(msg)); } catch {}
   }
 }
 
