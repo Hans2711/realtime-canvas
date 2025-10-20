@@ -320,20 +320,28 @@ export function startServer(options = {}) {
       if (type === 'identify') {
         const role = payload && payload.role === 'tiles' ? 'tiles' : (payload && payload.role === 'peer' ? 'peer' : null);
         if (role === 'peer') {
-          // Assign peer identity and add to broadcast list
-          const idNew = crypto.randomUUID();
-          const color = `hsl(${Math.floor(Math.random() * 360)}, 80%, 60%)`;
-          const name = `Guest-${idNew.slice(0, 4)}`;
-          ws.data = { role: 'peer', id: idNew, color, name, x: 0, y: 0 };
-          clients.set(idNew, ws);
+          // Allow client-provided id/name to resume a session
+          let desiredId = (payload && typeof payload.id === 'string' && payload.id.trim()) ? String(payload.id).trim() : null;
+          if (!desiredId) desiredId = crypto.randomUUID();
+          const safeName = (payload && typeof payload.name === 'string') ? String(payload.name).slice(0, 24) : undefined;
+          const initialColor = (payload && typeof payload.color === 'string') ? String(payload.color) : `hsl(${Math.floor(Math.random() * 360)}, 80%, 60%)`;
+
+          // If an existing client is registered under this id, replace it
+          const prev = clients.get(desiredId);
+          ws.data = { role: 'peer', id: desiredId, color: initialColor, name: safeName || `Guest-${desiredId.slice(0, 4)}`, x: 0, y: 0 };
+          clients.set(desiredId, ws);
+          if (prev && prev !== ws) {
+            try { prev.close(); } catch {}
+          }
+
           // Send welcome + current presence snapshot
           const snapshot = [];
           for (const [cid, cws] of clients) {
-            if (cid === idNew) continue;
+            if (cid === desiredId) continue;
             const d = cws.data;
             snapshot.push({ id: cid, color: d.color, name: d.name, x: d.x, y: d.y });
           }
-          try { ws.send(JSON.stringify({ type: 'welcome', payload: { id: idNew, color, name, others: snapshot } })); } catch {}
+          try { ws.send(JSON.stringify({ type: 'welcome', payload: { id: desiredId, color: ws.data.color, name: ws.data.name, others: snapshot } })); } catch {}
         } else if (role === 'tiles') {
           ws.data.role = 'tiles';
         }
@@ -408,7 +416,10 @@ export function startServer(options = {}) {
     },
     close(ws) {
       const id = ws.data?.id;
-      if (id) {
+      if (!id) return;
+      // Only broadcast leave if this websocket is still the active mapping for the id
+      const current = clients.get(id);
+      if (current === ws) {
         clients.delete(id);
         broadcast('leave', { id });
       }

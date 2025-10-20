@@ -85,6 +85,7 @@ const opacityInput = document.getElementById('opacity');
 const gridToggle = document.getElementById('toggle-grid');
 const zoomInBtn = document.getElementById('zoom-in');
 const zoomOutBtn = document.getElementById('zoom-out');
+const exportSvgBtn = document.getElementById('export-svg');
 
 // View transform (world -> screen)
 const view = {
@@ -122,6 +123,13 @@ if (savedOpacity) {
 }
 const initialTool = (['eraser','pan'].includes(localStorage.getItem('tool'))) ? localStorage.getItem('tool') : 'pen';
 let myName = null;
+// Persisted peer/session identity
+const LS_SESSION_ID = 'ic_session_id_v1';
+const LS_SESSION_NAME = 'ic_session_name_v1';
+try {
+  const n = localStorage.getItem(LS_SESSION_NAME);
+  if (n) myName = n;
+} catch {}
 let ws = null;
 let wsReady = false;
 
@@ -818,14 +826,28 @@ function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
   ws.addEventListener('open', () => { wsReady = true; dlog('WS open'); });
-  // Identify this connection as a peer (broadcast channel)
-  ws.addEventListener('open', () => { try { ws.send(JSON.stringify({ type: 'identify', payload: { role: 'peer' } })); } catch {} });
+  // Identify this connection as a peer (broadcast channel) with persisted session id if available
+  ws.addEventListener('open', () => {
+    try {
+      let sid = null;
+      try { sid = localStorage.getItem(LS_SESSION_ID) || null; } catch {}
+      const payload = { role: 'peer' };
+      if (sid) payload.id = sid;
+      if (myName) payload.name = myName;
+      // Provide a starting color so peers may see a consistent cursor before first presence broadcast
+      payload.color = myColor;
+      ws.send(JSON.stringify({ type: 'identify', payload }));
+    } catch {}
+  });
   ws.addEventListener('close', () => { wsReady = false; dlog('WS close'); setTimeout(connectWS, 1000); });
   ws.addEventListener('message', (ev) => {
     let msg; try { msg = JSON.parse(ev.data); } catch { return; }
     const { type, payload } = msg || {};
     if (type === 'welcome') {
       myId = payload.id; myName = payload.name;
+      // Persist session identity for future reloads
+      try { localStorage.setItem(LS_SESSION_ID, String(myId || '')); } catch {}
+      try { if (myName) localStorage.setItem(LS_SESSION_NAME, String(myName)); } catch {}
       for (const p of payload.others || []) { peers.set(p.id, p); }
       // Sync our current picker color to presence immediately
       const center = screenToWorld((canvas.width / STATE.dpr) / 2, (canvas.height / STATE.dpr) / 2);
@@ -991,6 +1013,179 @@ if (gridToggle) {
 // Zoom buttons (helpful on mobile where wheel isn't available)
 if (zoomInBtn) zoomInBtn.addEventListener('click', () => zoomToCenter(1.15));
 if (zoomOutBtn) zoomOutBtn.addEventListener('click', () => zoomToCenter(1 / 1.15));
+
+// SVG export (visible area)
+if (exportSvgBtn) exportSvgBtn.addEventListener('click', () => {
+  try { exportVisibleAreaToSvg(); } catch (e) { dlog('SVG export failed', e && e.message); }
+});
+
+function strokeBBox(stroke) {
+  const pts = Array.isArray(stroke?.points) ? stroke.points : [];
+  if (!pts.length) return null;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    const x = Number(p.x), y = Number(p.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  if (!Number.isFinite(minX)) return null;
+  const pad = (Number(stroke.size) || 4) * 0.5;
+  return { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad };
+}
+
+function pathDataFromPoints(pts) {
+  if (!Array.isArray(pts) || pts.length === 0) return '';
+  const f = (n) => {
+    const v = Math.round(Number(n) * 100) / 100; // 2dp to keep size small
+    return Number.isFinite(v) ? String(v) : '0';
+  };
+  let d = `M ${f(pts[0].x)} ${f(pts[0].y)}`;
+  for (let i = 1; i < pts.length; i++) d += ` L ${f(pts[i].x)} ${f(pts[i].y)}`;
+  return d;
+}
+
+function cmpByTime(a, b) {
+  const ta = Number(a?.t);
+  const tb = Number(b?.t);
+  const fa = Number.isFinite(ta) ? ta : Number.MAX_SAFE_INTEGER;
+  const fb = Number.isFinite(tb) ? tb : Number.MAX_SAFE_INTEGER;
+  if (fa !== fb) return fa - fb;
+  // Stable fallback: id
+  const ida = String(a?.id || '');
+  const idb = String(b?.id || '');
+  return ida < idb ? -1 : ida > idb ? 1 : 0;
+}
+
+function exportFile(name, contents, mime = 'image/svg+xml') {
+  try {
+    const blob = new Blob([contents], { type: mime + ';charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  } catch (e) { /* ignore */ }
+}
+
+async function exportVisibleAreaToSvg() {
+  const dpr = STATE.dpr;
+  const cssW = canvas.width / dpr;
+  const cssH = canvas.height / dpr;
+  const tl = screenToWorld(0, 0);
+  const br = screenToWorld(cssW, cssH);
+  const visMinX = Math.min(tl.x, br.x);
+  const visMinY = Math.min(tl.y, br.y);
+  const visMaxX = Math.max(tl.x, br.x);
+  const visMaxY = Math.max(tl.y, br.y);
+
+  // Gather server-authoritative strokes for all visible tiles
+  const tilesList = visibleTilesList();
+  if (!tilesList.length) return;
+  let tilesResp = [];
+  try { tilesResp = await fetchTilesBatchWithFallback(tilesList, 0); } catch (_) { tilesResp = []; }
+  const byId = new Map();
+  for (const t of tilesResp || []) {
+    const arr = Array.isArray(t?.strokes) ? t.strokes : [];
+    for (const s of arr) {
+      if (!s || !s.id) continue;
+      const prev = byId.get(s.id);
+      // Prefer instance that has a timestamp
+      if (!prev || (!Number.isFinite(prev.t) && Number.isFinite(s.t))) {
+        byId.set(s.id, s);
+      }
+    }
+  }
+
+  if (byId.size === 0) return;
+
+  // Keep only strokes that intersect visible bbox (with small pad)
+  const PAD = 2;
+  const bboxIntersects = (bb) => bb && !(bb.maxX < (visMinX - PAD) || bb.maxY < (visMinY - PAD) || bb.minX > (visMaxX + PAD) || bb.minY > (visMaxY + PAD));
+
+  const all = [];
+  for (const s of byId.values()) {
+    const bb = strokeBBox(s);
+    if (bboxIntersects(bb)) all.push(s);
+  }
+  if (all.length === 0) return;
+
+  // Compute tight bounding box around included strokes (including stroke width)
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const s of all) {
+    const bb = strokeBBox(s);
+    if (!bb) continue;
+    if (bb.minX < minX) minX = bb.minX;
+    if (bb.minY < minY) minY = bb.minY;
+    if (bb.maxX > maxX) maxX = bb.maxX;
+    if (bb.maxY > maxY) maxY = bb.maxY;
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return;
+  const W = Math.max(0, maxX - minX);
+  const H = Math.max(0, maxY - minY);
+  if (W <= 0 || H <= 0) return;
+
+  // Separate into normal and eraser strokes and sort by time
+  const erasers = all.filter(s => !!s.erase).sort(cmpByTime);
+  const paints = all.filter(s => !s.erase).sort(cmpByTime);
+
+  // Prebuild masks: one per suffix of erasers (later erasers should punch out earlier content)
+  const masks = [];
+  const maskIdForIndex = (idx) => `m${idx}`;
+  for (let i = 0; i <= erasers.length; i++) {
+    // mask i: white base minus all erasers with index >= i
+    const parts = [];
+    parts.push(`<rect x="${minX}" y="${minY}" width="${W}" height="${H}" fill="white"/>`);
+    for (let j = i; j < erasers.length; j++) {
+      const e = erasers[j];
+      const d = pathDataFromPoints(e.points);
+      if (!d) continue;
+      const sw = Number(e.size) || 4;
+      const op = Number.isFinite(e.opacity) ? e.opacity : 1;
+      // Black in mask removes content
+      parts.push(`<path d="${d}" fill="none" stroke="black" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="${op}"/>`);
+    }
+    masks.push(`<mask id="${maskIdForIndex(i)}" maskUnits="userSpaceOnUse" x="${minX}" y="${minY}" width="${W}" height="${H}">${parts.join('')}</mask>`);
+  }
+
+  // Helper: first eraser index strictly after t
+  const eraserTimes = erasers.map(e => Number(e.t));
+  function firstEraserAfter(t) {
+    if (!erasers.length) return erasers.length;
+    const tt = Number.isFinite(t) ? t : Number.MAX_SAFE_INTEGER;
+    let lo = 0, hi = eraserTimes.length; // [lo, hi)
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (eraserTimes[mid] > tt) hi = mid; else lo = mid + 1;
+    }
+    return lo; // index of first > t, possibly length
+  }
+
+  // Build SVG content
+  const header = `<?xml version="1.0" encoding="UTF-8"?>`;
+  const svgOpen = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${minX} ${minY} ${W} ${H}" fill="none">`;
+  const defs = `<defs>${masks.join('')}</defs>`;
+  const bodyParts = [];
+
+  for (const s of paints) {
+    const d = pathDataFromPoints(s.points);
+    if (!d) continue;
+    const sw = Number(s.size) || 4;
+    const color = String(s.color || '#000');
+    const op = Number.isFinite(s.opacity) ? s.opacity : 1;
+    const idx = firstEraserAfter(Number(s.t));
+    const maskAttr = erasers.length && idx < erasers.length ? ` mask="url(#${maskIdForIndex(idx)})"` : '';
+    bodyParts.push(`<g${maskAttr}><path d="${d}" fill="none" stroke="${color}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="${op}"/></g>`);
+  }
+
+  const svg = `${header}\n${svgOpen}${defs}${bodyParts.join('')}</svg>`;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  exportFile(`infinite-canvas-${ts}.svg`, svg);
+}
 
 function finalizeStroke(stroke) {
   // Draw onto tile canvases then broadcast/persist
